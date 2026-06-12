@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sprite Atlas Packer TexturePacker JSON-Array Atlas",
+  "type": "object",
+  "required": ["meta", "frames"],
+  "additionalProperties": true,
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["app", "version", "image", "size", "format", "scale", "trimmed"],
+      "properties": {
+        "app": { "const": "sprite-atlas-packer" },
+        "version": { "type": "string" },
+        "image": { "type": "string" },
+        "size": {
+          "type": "object",
+          "required": ["w", "h"],
+          "properties": {
+            "w": { "type": "integer", "minimum": 1 },
+            "h": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "format": { "const": "RGBA8888" },
+        "scale": { "type": "number" },
+        "trimmed": { "type": "boolean" }
+      }
+    },
+    "frames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "filename",
+          "frame",
+          "rotated",
+          "trimmed",
+          "spriteSourceSize",
+          "sourceSize",
+          "pivot"
+        ],
+        "properties": {
+          "filename": { "type": "string", "minLength": 1 },
+          "frame": { "$ref": "#/$defs/rect" },
+          "rotated": { "type": "boolean" },
+          "trimmed": { "type": "boolean" },
+          "spriteSourceSize": { "$ref": "#/$defs/rect" },
+          "sourceSize": { "$ref": "#/$defs/size" },
+          "pivot": {
+            "type": "object",
+            "required": ["x", "y"],
+            "properties": {
+              "x": { "type": "number", "minimum": 0, "maximum": 1 },
+              "y": { "type": "number", "minimum": 0, "maximum": 1 }
+            }
+          },
+          "duration_ms": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "animations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "frames", "loop", "fps_hint"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "frames": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "loop": { "type": "boolean" },
+          "fps_hint": { "type": "number", "exclusiveMinimum": 0 }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "rect": {
+      "type": "object",
+      "required": ["x", "y", "w", "h"],
+      "properties": {
+        "x": { "type": "integer", "minimum": 0 },
+        "y": { "type": "integer", "minimum": 0 },
+        "w": { "type": "integer", "minimum": 0 },
+        "h": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "size": {
+      "type": "object",
+      "required": ["w", "h"],
+      "properties": {
+        "w": { "type": "integer", "minimum": 0 },
+        "h": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
+

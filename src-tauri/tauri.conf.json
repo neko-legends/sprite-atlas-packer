@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Sprite Atlas Packer",
+  "version": "0.1.0",
+  "identifier": "com.nekolegends.spriteatlaspacker",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1450",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Sprite Atlas Packer",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 860,
+        "minHeight": 540,
+        "dragDropEnabled": true,
+        "resizable": true,
+        "fullscreen": false,
+        "backgroundColor": "#050505"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: blob: asset: http://asset.localhost https://asset.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "Neko Legends",
+    "copyright": "Copyright © Neko Legends",
+    "category": "GraphicsAndDesign",
+    "shortDescription": "Local deterministic sprite atlas packer",
+    "longDescription": "Sprite Atlas Packer turns loose sprite frames into deterministic TexturePacker-compatible PNG/WebP atlases."
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sprite Atlas Packer Project",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "sourceFolder": { "type": "string", "minLength": 1 },
+    "outputPath": { "type": "string", "minLength": 1 },
+    "format": { "enum": ["webp", "png", "both"] },
+    "pot": { "type": "boolean" },
+    "padding": { "type": "integer", "minimum": 0 },
+    "maxSize": { "type": "integer", "minimum": 1 },
+    "rotate": { "type": "boolean" },
+    "trim": { "type": "boolean" },
+    "asepriteJson": { "type": "boolean" },
+    "godotSpriteframes": { "type": "boolean" },
+    "unityImporter": { "type": "boolean" },
+    "animationRegex": { "type": "string", "minLength": 1 },
+    "stablePivot": { "type": "boolean" },
+    "dedupThreshold": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "linkedChannels": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "packingStrategy": { "enum": ["maxrects", "guillotine", "quadtree", "shelf"] },
+    "animations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/animation" }
+    }
+  },
+  "$defs": {
+    "animation": {
+      "type": "object",
+      "required": ["name", "frames"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "frames": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "loop": { "type": "boolean" },
+        "fpsHint": { "type": "number", "exclusiveMinimum": 0 },
+        "pivot": { "$ref": "#/$defs/pivot" },
+        "durationMs": { "type": "integer", "minimum": 1 },
+        "frameOverrides": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/frameOverride" }
+        }
+      }
+    },
+    "frameOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pivot": { "$ref": "#/$defs/pivot" },
+        "durationMs": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "pivot": {
+      "type": "object",
+      "required": ["x", "y"],
+      "additionalProperties": false,
+      "properties": {
+        "x": { "type": "number", "minimum": 0, "maximum": 1 },
+        "y": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    }
+  }
+}

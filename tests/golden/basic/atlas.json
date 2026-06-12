@@ -1,0 +1,114 @@
+{
+  "meta": {
+    "app": "sprite-atlas-packer",
+    "version": "1.0",
+    "image": "sheet.png",
+    "size": {
+      "w": 32,
+      "h": 16
+    },
+    "format": "RGBA8888",
+    "scale": 1.0,
+    "trimmed": true
+  },
+  "frames": [
+    {
+      "filename": "hero_idle_0",
+      "frame": {
+        "x": 12,
+        "y": 2,
+        "w": 5,
+        "h": 4
+      },
+      "rotated": false,
+      "trimmed": true,
+      "spriteSourceSize": {
+        "x": 2,
+        "y": 3,
+        "w": 5,
+        "h": 4
+      },
+      "sourceSize": {
+        "w": 10,
+        "h": 10
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      },
+      "duration_ms": 120
+    },
+    {
+      "filename": "hero_idle_1",
+      "frame": {
+        "x": 2,
+        "y": 2,
+        "w": 6,
+        "h": 5
+      },
+      "rotated": false,
+      "trimmed": true,
+      "spriteSourceSize": {
+        "x": 1,
+        "y": 2,
+        "w": 6,
+        "h": 5
+      },
+      "sourceSize": {
+        "w": 10,
+        "h": 10
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      },
+      "duration_ms": 120
+    },
+    {
+      "filename": "hero_run_0",
+      "frame": {
+        "x": 21,
+        "y": 2,
+        "w": 4,
+        "h": 4
+      },
+      "rotated": false,
+      "trimmed": true,
+      "spriteSourceSize": {
+        "x": 2,
+        "y": 2,
+        "w": 4,
+        "h": 4
+      },
+      "sourceSize": {
+        "w": 8,
+        "h": 8
+      },
+      "pivot": {
+        "x": 0.5,
+        "y": 0.5
+      },
+      "duration_ms": 120
+    }
+  ],
+  "animations": [
+    {
+      "name": "hero_idle",
+      "frames": [
+        "hero_idle_0",
+        "hero_idle_1"
+      ],
+      "loop": true,
+      "fps_hint": 8.333333
+    },
+    {
+      "name": "hero_run",
+      "frames": [
+        "hero_run_0"
+      ],
+      "loop": true,
+      "fps_hint": 8.333333
+    }
+  ]
+}
+
