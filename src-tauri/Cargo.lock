@@ -3349,6 +3349,7 @@ name = "sprite-atlas-packer"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "dirs",
  "image",
  "notify",
  "regex",

@@ -39,6 +39,9 @@ const RASTER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
 const ASEPRITE_EXTENSIONS: &[&str] = &["ase", "aseprite"];
 const SUPPORTED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "ase", "aseprite"];
 const ASEPRITE_BIN_ENV: &str = "SPRITE_ATLAS_PACKER_ASEPRITE_BIN";
+const AGENT_API_REGISTRY_FILE: &str = "agent-api-registry.json";
+const SAP_DEFAULT_PORT: u16 = 9877;
+const SAP_BIND_ADDRESS: &str = "127.0.0.1";
 
 #[derive(Debug, Error)]
 pub enum AtlasError {
@@ -2043,22 +2046,138 @@ fn write_control_discovery(config: &ServeConfig) -> Result<()> {
         &path,
         &format!("{}\n", serde_json::to_string_pretty(&value)?),
     )?;
+    register_agent_api(config, false, None);
     Ok(())
 }
 
 fn control_discovery_path() -> PathBuf {
-    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(config_home)
+    #[cfg(windows)]
+    {
+        return dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
             .join(APP_NAME)
             .join("control-api.json");
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join(APP_NAME)
-            .join("control-api.json");
+    #[cfg(not(windows))]
+    {
+        if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
+            return PathBuf::from(config_home)
+                .join(APP_NAME)
+                .join("control-api.json");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home)
+                .join(".config")
+                .join(APP_NAME)
+                .join("control-api.json");
+        }
+        PathBuf::from("control-api.json")
     }
-    PathBuf::from("control-api.json")
+}
+
+fn agent_api_registry_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|root| root.join("NekoLegends").join(AGENT_API_REGISTRY_FILE))
+}
+
+fn registry_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+fn read_registry_value(path: &Path) -> serde_json::Value {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(|value| value.is_object())
+        .unwrap_or_else(|| serde_json::json!({ "updatedAt": registry_timestamp(), "apps": [] }))
+}
+
+fn with_registry_lock<F>(path: &Path, mut write: F) -> Result<()>
+where
+    F: FnMut() -> Result<()>,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = path.with_extension("json.lock");
+    for _ in 0..3 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => {
+                let result = write();
+                let _ = fs::remove_file(&lock_path);
+                return result;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .map(|elapsed| elapsed > Duration::from_secs(2))
+                    .unwrap_or(false);
+                if stale {
+                    let _ = fs::remove_file(&lock_path);
+                } else {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(AtlasError::Message("Agent API registry is busy.".to_string()))
+}
+
+fn register_agent_api(config: &ServeConfig, busy: bool, active_job_id: Option<String>) {
+    let Some(path) = agent_api_registry_path() else {
+        return;
+    };
+    let _ = with_registry_lock(&path, || {
+        let mut registry = read_registry_value(&path);
+        registry["updatedAt"] = serde_json::json!(registry_timestamp());
+        if !registry.get("apps").map(serde_json::Value::is_array).unwrap_or(false) {
+            registry["apps"] = serde_json::json!([]);
+        }
+        let url = format!("http://{}:{}", config.host, config.port);
+        let entry = serde_json::json!({
+            "appId": "sprite-atlas-packer",
+            "appName": "Sprite Atlas Packer",
+            "defaultPort": SAP_DEFAULT_PORT,
+            "bindAddress": SAP_BIND_ADDRESS,
+            "port": config.port,
+            "enabled": true,
+            "url": url,
+            "openapiUrl": format!("{url}/openapi.json"),
+            "busy": busy,
+            "activeJobId": active_job_id,
+            "lastSeen": registry_timestamp(),
+            "note": "Pack/slice control API."
+        });
+        if let Some(apps) = registry.get_mut("apps").and_then(serde_json::Value::as_array_mut) {
+            if let Some(existing) = apps.iter_mut().find(|candidate| {
+                candidate
+                    .get("appId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|app_id| app_id == "sprite-atlas-packer")
+                    .unwrap_or(false)
+            }) {
+                *existing = entry;
+            } else {
+                apps.push(entry);
+            }
+        }
+        write_text_if_changed(
+            &path,
+            &format!("{}\n", serde_json::to_string_pretty(&registry)?),
+        )?;
+        Ok(())
+    });
 }
 
 fn handle_control_connection(
@@ -2070,6 +2189,9 @@ fn handle_control_connection(
     let request = read_http_request(&mut stream)?;
     if request.method == "OPTIONS" {
         return write_http_json(&mut stream, 204, &serde_json::json!({}));
+    }
+    if request.method == "GET" && request.path == "/openapi.json" {
+        return write_http_json(&mut stream, 200, &control_openapi_json());
     }
     if !is_authorized(&request, &config.token) {
         return write_http_json(
@@ -2173,6 +2295,23 @@ fn handle_control_connection(
             &serde_json::json!({ "error": "Unknown endpoint" }),
         ),
     }
+}
+
+fn control_openapi_json() -> serde_json::Value {
+    serde_json::json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "Sprite Atlas Packer Control API",
+            "version": VERSION
+        },
+        "paths": {
+            "/api/v1/state": { "get": { "summary": "Control server state" } },
+            "/api/v1/atlas": { "get": { "summary": "Last atlas result" } },
+            "/api/v1/pack": { "post": { "summary": "Pack sprites into an atlas" } },
+            "/api/v1/slice": { "post": { "summary": "Slice a sprite sheet into frames" } },
+            "/api/v1/events": { "get": { "summary": "Event stream" } }
+        }
+    })
 }
 
 fn control_state_json(state: &ControlState) -> serde_json::Value {
@@ -4471,6 +4610,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let input = temp.path().join("input");
         let output = temp.path().join("out");
+        #[cfg(windows)]
+        let fake_bin = temp.path().join("fake-aseprite.cmd");
+        #[cfg(not(windows))]
         let fake_bin = temp.path().join("fake-aseprite");
         let frames = temp.path().join("frames");
         fs::create_dir_all(&input).unwrap();
@@ -4478,6 +4620,17 @@ mod tests {
         fs::write(input.join("hero_run.aseprite"), b"fake aseprite document").unwrap();
         write_test_sprite(&frames.join("frame0.png"), [255, 0, 0, 255], 3, 3);
         write_test_sprite(&frames.join("frame1.png"), [0, 255, 0, 255], 3, 3);
+        #[cfg(windows)]
+        fs::write(
+            &fake_bin,
+            format!(
+                "@echo off\r\nsetlocal\r\nset \"out=\"\r\nset \"prev=\"\r\n:loop\r\nif \"%~1\"==\"\" goto done\r\nif \"%prev%\"==\"--save-as\" set \"out=%~1\"\r\nset \"prev=%~1\"\r\nshift\r\ngoto loop\r\n:done\r\nset \"out0=%out:{{frame}}=0%\"\r\nset \"out1=%out:{{frame}}=1%\"\r\ncopy /Y \"{}\" \"%out0%\" >NUL\r\ncopy /Y \"{}\" \"%out1%\" >NUL\r\n",
+                frames.join("frame0.png").display(),
+                frames.join("frame1.png").display()
+            ),
+        )
+        .unwrap();
+        #[cfg(not(windows))]
         fs::write(
             &fake_bin,
             format!(
@@ -4987,6 +5140,8 @@ mod tests {
 
         let expected_atlas = include_str!("../../tests/golden/basic/atlas.json");
         let actual_atlas = fs::read_to_string(output.join("atlas.json")).unwrap();
+        let expected_atlas = expected_atlas.replace("\r\n", "\n");
+        let actual_atlas = actual_atlas.replace("\r\n", "\n");
         assert_eq!(
             actual_atlas.trim_end_matches('\n'),
             expected_atlas.trim_end_matches('\n')
