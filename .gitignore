@@ -3,13 +3,26 @@ node_modules/
 
 # Build outputs
 dist/
+release/
 target/
 src-tauri/target/
+src-tauri/gen/
+src-tauri/bundle/
+src-tauri/.tauri/
 
 # Logs and temporary files
 *.log
 *.tmp
 *.temp
+sap-*.txt
+sap-vite-*.txt
+control-api.json
+*.exe
+*.msi
+*.dmg
+*.zip
+*.7z
+*.tar.gz
 .DS_Store
 Thumbs.db
 
@@ -28,3 +41,10 @@ Thumbs.db
 build/
 out/
 output/
+
+# Local video demo inputs/outputs; keep only the README preview GIF.
+demo-cat-walk/*
+!demo-cat-walk/
+!demo-cat-walk/video-tool-output/
+demo-cat-walk/video-tool-output/*
+!demo-cat-walk/video-tool-output/cat_walk_video_preview_slow_7fps.gif

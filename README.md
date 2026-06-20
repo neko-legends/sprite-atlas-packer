@@ -10,6 +10,8 @@ accepted through the local Aseprite CLI, exporting frames to temporary PNGs
 before packing; set `SPRITE_ATLAS_PACKER_ASEPRITE_BIN` if the binary is not
 named `aseprite` on your PATH.
 
+![Video to packed sprite animation preview](demo-cat-walk/video-tool-output/cat_walk_video_preview_slow_7fps.gif)
+
 ```bash
 cargo run --manifest-path src-tauri/Cargo.toml -- \
   --headless \
@@ -114,12 +116,28 @@ layouts). Project files store this as `packingStrategy`.
 `--rotate` allows non-square sprites to be stored rotated 90 degrees when that
 helps them fit; it is off by default for importer compatibility.
 
+## Video to Sprite Animation
+
+The desktop GUI includes a **Video** panel for turning a short walk-cycle clip
+into a packed sprite animation. Choose an MP4/WebM/MOV/M4V, pick a 4x4, 5x5, or
+custom grid, set the frame size, FPS, and optional start/end trim, then run
+**Make Sprite Sheet**. The app samples the video into ordered PNG frames, packs
+them through the generated-frame normalizer, and writes a transparent-frame
+`sheet.png`, `atlas.json`, `aseprite.json`, `frames/*.png`, and an animated GIF
+preview.
+
+The packed output keeps transparent canvas space around each pose, so the atlas
+is ready for game animation import. If the source video already has alpha or a
+transparent/clean keyed subject, that transparency is preserved through the PNG
+frame and atlas pipeline.
+
 ## Local Control API
 
 Agents can drive a running local server with bearer-token auth. In the desktop
-app, use the `Remote` panel to enable AI Agent Remote Control for the current
-session; it starts off, then shows the local address and generated token after
-you enable it. The same API can also be started from the CLI:
+app, the `Remote` panel shows the AI Agent Control checkbox, local address, and
+generated token. The current desktop build starts the local control API
+automatically, and the checkbox can disable or re-enable it for the session.
+The same API can also be started from the CLI:
 
 ```bash
 cargo run --manifest-path src-tauri/Cargo.toml -- \
@@ -134,6 +152,11 @@ The server writes `~/.config/sprite-atlas-packer/control-api.json` and exposes:
 - `GET /api/v1/state`
 - `POST /api/v1/pack`
 - `POST /api/v1/slice`
+- `POST /api/v1/animation-job/start`
+- `POST /api/v1/animation-job/submit-frame`
+- `POST /api/v1/animation-job/assemble`
+- `POST /api/v1/assemble-generated-loop`
+- `POST /api/v1/export-gif`
 - `GET /api/v1/atlas`
 - `WebSocket /api/v1/events?token=<token>`
 
@@ -171,6 +194,108 @@ cargo run --manifest-path src-tauri/Cargo.toml -- \
 
 Grid mode accepts an explicit cell size or attempts to infer cells from
 transparent gutters. Alpha mode detects connected non-transparent components.
+
+For AI/generated spritesheets, reverse mode can clean generated mattes,
+auto-refine grid cell boundaries from visible sprite clusters, normalize every
+frame with one global scale, and place the result on stable transparent frame
+canvases before writing the normal sheet, frames, and atlas. Prefer transparent
+PNG from image generation; if the model needs visible separators, use a thin
+dark neutral gray separator or outline instead of green chroma. Generated
+normalization strips dark neutral matte connected to sheet/cell edges and
+cleans green spill as a fallback.
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml -- \
+  --headless \
+  --input ./generated/hero_walk_raw.png \
+  --output ./build/normalized \
+  --slice grid \
+  --cell 256x256 \
+  --prefix hero_walk \
+  --format png \
+  --normalize-generated \
+  --frame-size 256x256
+```
+
+This writes `spritesheet_normalization.json` beside `atlas.json` with the
+detected source cells, normalized frame boxes, root anchors, global scale,
+continuity diagnostics, and policy strings. For walking loops, warnings about
+random adjacent pose jumps or a poor last-to-first transition mean the generated
+sheet should be regenerated with explicit gait poses. The output `frames/`
+folder can be packed again with normal pack mode when you want a tighter
+production atlas.
+
+For agent-driven frame-at-a-time generation, keep the original packer workflow
+separate and use the control API to assemble generated loop frames from a
+folder. Name the images in the intended playback order, such as
+`000_contact.png`, `001_inbetween.png`, and so on:
+
+```bash
+curl -s -X POST \
+  -H "Authorization: Bearer sap-local" \
+  -H "Content-Type: application/json" \
+  --data-binary @assemble-loop.json \
+  http://127.0.0.1:9877/api/v1/assemble-generated-loop
+```
+
+`assemble-loop.json`:
+
+```json
+{
+  "input": "/absolute/path/to/generated/ordered_frames",
+  "output": "/absolute/path/to/build/assembled_walk",
+  "columns": 4,
+  "frameWidth": 256,
+  "frameHeight": 256,
+  "prefix": "hero_walk",
+  "format": "png",
+  "asepriteJson": true
+}
+```
+
+This endpoint normalizes each separate generated frame with the same matte
+cleanup, global scale, root anchoring, and continuity diagnostics used by
+generated-sheet slicing, then writes the assembled sheet and atlas.
+
+For stricter agent-driven animation, use animation jobs. A job creates the
+frame plan and SVG pose guides first, then accepts or rejects one generated
+frame at a time before assembly:
+
+```bash
+curl -s -X POST \
+  -H "Authorization: Bearer sap-local" \
+  -H "Content-Type: application/json" \
+  -d '{"output":"/absolute/path/to/jobs/cat_walk","action":"cat_walk","frameCount":16,"columns":4,"frameWidth":256,"frameHeight":256,"prefix":"cat_walk"}' \
+  http://127.0.0.1:9877/api/v1/animation-job/start
+```
+
+The response includes `animation_job.json`, `pose_guides/*.svg`, and frame
+prompts. The prompts describe the same checks the API applies: stable root,
+stable ground line, visible front/hind paw contacts, readable paw spacing,
+locked palette/style, and no duplicate tail frame. Generate frame images one at
+a time, then submit each candidate:
+
+```bash
+curl -s -X POST \
+  -H "Authorization: Bearer sap-local" \
+  -H "Content-Type: application/json" \
+  -d '{"jobDir":"/absolute/path/to/jobs/cat_walk","frameIndex":0,"sourcePath":"/absolute/path/to/generated/000.png"}' \
+  http://127.0.0.1:9877/api/v1/animation-job/submit-frame
+```
+
+If the validation response is not accepted, regenerate that frame using the
+reported errors/warnings and the same pose guide. The validation report includes
+foreground `style` stats and lower-body `gait` stats so agents can see whether a
+frame failed because it changed identity/style or because it is not a readable
+walk pose. When every frame is accepted:
+
+```bash
+curl -s -X POST \
+  -H "Authorization: Bearer sap-local" \
+  -H "Content-Type: application/json" \
+  -d '{"jobDir":"/absolute/path/to/jobs/cat_walk","format":"png","asepriteJson":true}' \
+  http://127.0.0.1:9877/api/v1/animation-job/assemble
+```
 
 The previewer scrubs the same `atlas.json` that gets written, with thumbnail
 timelines, onion-skin, loop/ping-pong playback, arrow-key stepping, FPS override,

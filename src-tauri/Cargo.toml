@@ -1,6 +1,6 @@
 [package]
 name = "sprite-atlas-packer"
-version = "0.1.0"
+version = "26.6.19"
 description = "Local deterministic sprite atlas packer"
 authors = ["Neko Legends"]
 license = "MIT"

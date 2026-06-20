@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { open } from '@tauri-apps/plugin-dialog'
 import { save } from '@tauri-apps/plugin-dialog'
@@ -65,6 +65,25 @@ type SliceOptions = {
   prefix: string
   dryRun: boolean
   asepriteJson: boolean
+  normalizeGenerated: boolean
+  frameWidth: number
+  frameHeight: number
+}
+
+type VideoGridPreset = '4x4' | '5x5' | 'custom'
+
+type VideoOptions = {
+  input: string
+  output: string
+  gridPreset: VideoGridPreset
+  columns: number
+  rows: number
+  frameWidth: number
+  frameHeight: number
+  startTime: number
+  endTime: number
+  fps: number
+  prefix: string
 }
 
 type PackReport = {
@@ -93,6 +112,23 @@ type SliceReport = {
   frames: string[]
   wrote: string[]
   atlas: Atlas
+  normalization?: SliceNormalizationReport
+}
+
+type SliceNormalizationReport = {
+  sourceSheetSize: Size
+  outputSheetSize: Size
+  outputFrameSize: Size
+  sourceColumns?: number
+  sourceRows?: number
+  sourceCells: Rect[]
+  frameBboxes: Array<Rect | null>
+  rootAnchors: Array<{ x: number; y: number } | null>
+  scale: number
+  gridPolicy: string
+  gridDetection: string
+  proportionPolicy: string
+  rootAnchorPolicy: string
 }
 
 type GifExportReport = {
@@ -117,6 +153,24 @@ type AgentControlInfo = {
   baseUrl: string
   discoveryFile: string
 }
+
+type ControlPackEvent = {
+  type: 'pack'
+  atlas: Atlas
+  sheetPath: string
+  outputPath: string
+  wrote?: string[]
+}
+
+type ControlSliceEvent = {
+  type: 'slice' | 'assembleGeneratedLoop' | 'animationJobAssemble'
+  atlas: Atlas
+  sheetPath: string
+  outputPath: string
+  wrote?: string[]
+}
+
+type ControlEvent = ControlPackEvent | ControlSliceEvent
 
 type Atlas = {
   meta: {
@@ -158,6 +212,7 @@ type Size = {
 }
 
 const SETTINGS_KEY = 'spriteAtlasPacker.settings.v1'
+const APP_VERSION_LABEL = 'v26.6.19'
 
 const defaultOptions: PackOptions = {
   input: '',
@@ -179,8 +234,22 @@ const defaultOptions: PackOptions = {
   linkedChannels: [],
 }
 
+const defaultVideoOptions: VideoOptions = {
+  input: '',
+  output: '',
+  gridPreset: '4x4',
+  columns: 4,
+  rows: 4,
+  frameWidth: 256,
+  frameHeight: 256,
+  startTime: 0,
+  endTime: 0,
+  fps: 12,
+  prefix: 'video_walk',
+}
+
 function isTauriRuntime(): boolean {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+  return isTauri()
 }
 
 function classNames(...items: Array<string | false | null | undefined>): string {
@@ -196,6 +265,11 @@ function compactPath(path: string): string {
 
 function fileName(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path
+}
+
+function parentPath(path: string): string {
+  const index = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'))
+  return index > 0 ? path.slice(0, index) : ''
 }
 
 function normalizeLinkedChannels(value: string): string[] {
@@ -266,6 +340,131 @@ function clamp(value: number, min: number, max: number): number {
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+function waitForVideoMetadata(video: HTMLVideoElement): Promise<void> {
+  if (video.readyState >= 1 && Number.isFinite(video.duration)) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup()
+      reject(new Error('Video metadata did not load in time'))
+    }, 8000)
+    const cleanup = () => {
+      window.clearTimeout(timeout)
+      video.removeEventListener('loadedmetadata', handleMetadata)
+      video.removeEventListener('error', handleError)
+    }
+    const handleMetadata = () => {
+      cleanup()
+      resolve()
+    }
+    const handleError = () => {
+      cleanup()
+      reject(new Error('Could not load the selected video'))
+    }
+    video.addEventListener('loadedmetadata', handleMetadata, { once: true })
+    video.addEventListener('error', handleError, { once: true })
+    video.load()
+  })
+}
+
+function seekVideo(video: HTMLVideoElement, time: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const target = clamp(time, 0, Number.isFinite(video.duration) ? video.duration : time)
+    const timeout = window.setTimeout(() => {
+      cleanup()
+      reject(new Error(`Video seek timed out at ${target.toFixed(2)}s`))
+    }, 8000)
+    const cleanup = () => {
+      window.clearTimeout(timeout)
+      video.removeEventListener('seeked', handleSeeked)
+      video.removeEventListener('error', handleError)
+    }
+    const handleSeeked = () => {
+      cleanup()
+      window.requestAnimationFrame(() => resolve())
+    }
+    const handleError = () => {
+      cleanup()
+      reject(new Error(`Could not seek video to ${target.toFixed(2)}s`))
+    }
+    video.addEventListener('seeked', handleSeeked, { once: true })
+    video.addEventListener('error', handleError, { once: true })
+    video.currentTime = target
+  })
+}
+
+function drawVideoFrame(video: HTMLVideoElement, canvas: HTMLCanvasElement, width: number, height: number) {
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('Canvas drawing is unavailable')
+  canvas.width = width
+  canvas.height = height
+  context.clearRect(0, 0, width, height)
+  context.imageSmoothingEnabled = true
+  context.imageSmoothingQuality = 'high'
+  const sourceWidth = video.videoWidth || width
+  const sourceHeight = video.videoHeight || height
+  const scale = Math.min(width / Math.max(1, sourceWidth), height / Math.max(1, sourceHeight))
+  const drawWidth = Math.round(sourceWidth * scale)
+  const drawHeight = Math.round(sourceHeight * scale)
+  const x = Math.floor((width - drawWidth) / 2)
+  const y = Math.floor((height - drawHeight) / 2)
+  context.drawImage(video, x, y, drawWidth, drawHeight)
+}
+
+function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<number[]> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(async (blob) => {
+      if (!blob) {
+        reject(new Error('Could not encode sampled frame as PNG'))
+        return
+      }
+      try {
+        resolve(Array.from(new Uint8Array(await blob.arrayBuffer())))
+      } catch (error) {
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    }, 'image/png')
+  })
+}
+
+function agentEventsUrl(info: AgentControlInfo): string {
+  const url = new URL(info.baseUrl)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/events`
+  url.searchParams.set('token', info.token)
+  return url.toString()
+}
+
+function remotePackReport(event: ControlPackEvent): PackReport {
+  const atlasWidth = event.atlas.meta.size.w
+  const atlasHeight = event.atlas.meta.size.h
+  const usedPixels = event.atlas.frames.reduce((total, frame) => total + frame.frame.w * frame.frame.h, 0)
+  const atlasPixels = Math.max(1, atlasWidth * atlasHeight)
+  return {
+    inputCount: event.atlas.frames.length,
+    atlasWidth,
+    atlasHeight,
+    packingStrategy: 'remote',
+    usedPixels,
+    wastePercent: Math.max(0, (1 - usedPixels / atlasPixels) * 100),
+    frames: event.atlas.frames.map((frame) => frame.filename),
+    animations: event.atlas.animations?.map((animation) => animation.name) ?? [],
+    wrote: event.wrote ?? [],
+    aliases: [],
+    atlas: event.atlas,
+  }
+}
+
+function remoteSliceReport(event: ControlSliceEvent): SliceReport {
+  return {
+    frameCount: event.atlas.frames.length,
+    sheetWidth: event.atlas.meta.size.w,
+    sheetHeight: event.atlas.meta.size.h,
+    frames: event.atlas.frames.map((frame) => frame.filename),
+    wrote: event.wrote ?? [],
+    atlas: event.atlas,
+  }
 }
 
 function loadImage(src: string): Promise<HTMLImageElement> {
@@ -740,7 +939,14 @@ function App() {
     prefix: 'slice',
     dryRun: false,
     asepriteJson: false,
+    normalizeGenerated: false,
+    frameWidth: 256,
+    frameHeight: 256,
   })
+  const [videoOptions, setVideoOptions] = useState<VideoOptions>(defaultVideoOptions)
+  const [videoSourceUrl, setVideoSourceUrl] = useState('')
+  const [videoDuration, setVideoDuration] = useState(0)
+  const [videoPreviewGif, setVideoPreviewGif] = useState('')
   const [report, setReport] = useState<PackReport | null>(null)
   const [sliceReport, setSliceReport] = useState<SliceReport | null>(null)
   const [notice, setNotice] = useState('Ready')
@@ -752,8 +958,12 @@ function App() {
   const [hotReload, setHotReload] = useState(false)
   const [hotReloadSignature, setHotReloadSignature] = useState('')
   const [log, setLog] = useState<string[]>([])
+  const videoRef = useRef<HTMLVideoElement | null>(null)
 
   const canRun = Boolean(options.input.trim()) && Boolean(options.output.trim()) && !busy
+  const videoFrameCount = Math.max(1, videoOptions.columns * videoOptions.rows)
+  const effectiveVideoEnd = videoDuration > 0 && videoOptions.endTime > videoOptions.startTime ? videoOptions.endTime : videoDuration
+  const videoRangeSeconds = Math.max(0, effectiveVideoEnd - videoOptions.startTime)
   const atlasSize = report ? `${report.atlasWidth} x ${report.atlasHeight}` : '0 x 0'
   const frameCount = report?.frames.length ?? 0
   const animationCount = report?.animations.length ?? 0
@@ -773,8 +983,63 @@ function App() {
 
   useEffect(() => {
     if (!isTauriRuntime()) return
-    void refreshAgentControl()
+    void setAgentControlEnabled(true)
   }, [])
+
+  useEffect(() => {
+    if (!agentControl?.enabled || !agentControl.token) return
+    let closed = false
+    const socket = new WebSocket(agentEventsUrl(agentControl))
+
+    socket.onopen = () => {
+      if (!closed) pushLog('AI Agent Control event stream connected.')
+    }
+    socket.onmessage = (message) => {
+      void (async () => {
+        try {
+          const event = JSON.parse(String(message.data)) as ControlEvent
+          if (
+            event.type !== 'pack' &&
+            event.type !== 'slice' &&
+            event.type !== 'assembleGeneratedLoop' &&
+            event.type !== 'animationJobAssemble'
+          ) {
+            return
+          }
+          const preview = await invoke<string>('preview_image_data_url', { path: event.sheetPath })
+          setSheetPreview(preview)
+          setComparison(null)
+          if (event.type === 'pack') {
+            const nextReport = remotePackReport(event)
+            setReport(nextReport)
+            setSliceReport(null)
+            setOptions((current) => ({ ...current, output: event.outputPath }))
+            const summary = `${nextReport.inputCount} sprites, ${nextReport.atlasWidth} x ${nextReport.atlasHeight}`
+            setNotice(`Remote pack: ${summary}`)
+            pushLog(`Remote pack preview loaded: ${summary}.`)
+          } else {
+            const nextReport = remoteSliceReport(event)
+            setSliceReport(nextReport)
+            setReport(null)
+            setOptions((current) => ({ ...current, output: event.outputPath }))
+            const summary = `${nextReport.frameCount} frames from ${nextReport.sheetWidth} x ${nextReport.sheetHeight}`
+            setNotice(`Remote slice: ${summary}`)
+            pushLog(`Remote slice preview loaded: ${summary}.`)
+          }
+        } catch (error) {
+          pushLog(`Remote preview event failed: ${String(error)}`)
+        }
+      })()
+    }
+    socket.onerror = () => {
+      if (!closed) pushLog('AI Agent Control event stream error.')
+    }
+
+    return () => {
+      closed = true
+      socket.close()
+    }
+  }, [agentControl, pushLog])
 
   useEffect(() => {
     if (!isTauriRuntime()) return
@@ -840,13 +1105,14 @@ function App() {
     }
   }
 
-  async function toggleAgentControl() {
+  async function setAgentControlEnabled(enabled: boolean) {
     if (!isTauriRuntime()) {
       setNotice('Desktop runtime required for remote control')
       return
     }
+    if (agentControl?.enabled === enabled) return
     try {
-      const next = await invoke<AgentControlInfo>(agentControl?.enabled ? 'stop_agent_control_gui' : 'start_agent_control_gui')
+      const next = await invoke<AgentControlInfo>(enabled ? 'start_agent_control_gui' : 'stop_agent_control_gui')
       setAgentControl(next)
       setNotice(next.enabled ? `Remote control enabled on ${next.baseUrl}` : 'Remote control disabled')
       pushLog(next.enabled ? `Remote control enabled: ${next.baseUrl}` : 'Remote control disabled.')
@@ -907,6 +1173,163 @@ function App() {
       setSliceOptions((current) => ({ ...current, input: selected, output: current.output || options.output }))
       setNotice(`Sheet set to ${fileName(selected)}`)
       pushLog(`Sheet source: ${selected}`)
+    }
+  }
+
+  async function chooseVideo() {
+    if (!isTauriRuntime()) {
+      setNotice('Desktop runtime required for video picking')
+      return
+    }
+    const selected = await open({
+      directory: false,
+      multiple: false,
+      defaultPath: videoOptions.input || options.input || undefined,
+      filters: [{ name: 'Videos', extensions: ['mp4', 'webm', 'mov', 'm4v'] }],
+    })
+    if (typeof selected === 'string') {
+      const defaultOutput = videoOptions.output || joinPath(parentPath(selected), 'sprite-output')
+      setVideoOptions((current) => ({ ...current, input: selected, output: current.output || defaultOutput }))
+      setVideoSourceUrl(convertFileSrc(selected))
+      setVideoDuration(0)
+      setVideoPreviewGif('')
+      setNotice(`Video set to ${fileName(selected)}`)
+      pushLog(`Video source: ${selected}`)
+    }
+  }
+
+  async function chooseVideoOutput() {
+    if (!isTauriRuntime()) {
+      setNotice('Desktop runtime required for folder picking')
+      return
+    }
+    const selected = await open({ directory: true, multiple: false, defaultPath: videoOptions.output || options.output || undefined })
+    if (typeof selected === 'string') {
+      setVideoOptions((current) => ({ ...current, output: selected }))
+      setNotice(`Video output set to ${fileName(selected)}`)
+      pushLog(`Video output folder: ${selected}`)
+    }
+  }
+
+  function setVideoGridPreset(gridPreset: VideoGridPreset) {
+    setVideoOptions((current) => {
+      if (gridPreset === '4x4') return { ...current, gridPreset, columns: 4, rows: 4 }
+      if (gridPreset === '5x5') return { ...current, gridPreset, columns: 5, rows: 5 }
+      return { ...current, gridPreset }
+    })
+  }
+
+  async function runVideoToSpriteSheet() {
+    if (!isTauriRuntime()) {
+      setNotice('Desktop runtime required for video extraction')
+      return
+    }
+    if (!videoOptions.input.trim()) {
+      setNotice('Choose a video first')
+      return
+    }
+    const video = videoRef.current
+    if (!video) {
+      setNotice('Video preview is not ready yet')
+      return
+    }
+    const output = videoOptions.output || options.output || joinPath(parentPath(videoOptions.input), 'sprite-output')
+    if (!output.trim()) {
+      setNotice('Choose an output folder')
+      return
+    }
+
+    setBusy(true)
+    setReport(null)
+    setSliceReport(null)
+    setSheetPreview('')
+    setComparison(null)
+    setVideoPreviewGif('')
+    setNotice('Loading video...')
+    try {
+      if (!videoSourceUrl) {
+        setVideoSourceUrl(convertFileSrc(videoOptions.input))
+      }
+      await waitForVideoMetadata(video)
+      const duration = Number.isFinite(video.duration) ? video.duration : 0
+      const start = clamp(videoOptions.startTime, 0, Math.max(0, duration))
+      const requestedEnd = videoOptions.endTime > start ? videoOptions.endTime : duration
+      const end = clamp(requestedEnd, start, Math.max(start, duration))
+      const usableDuration = Math.max(0.001, end - start)
+      const frameWidth = Math.max(16, Math.round(videoOptions.frameWidth) || 256)
+      const frameHeight = Math.max(16, Math.round(videoOptions.frameHeight) || 256)
+      const columns = Math.max(1, Math.round(videoOptions.columns) || 1)
+      const rows = Math.max(1, Math.round(videoOptions.rows) || 1)
+      const frameCount = columns * rows
+      const prefix = videoOptions.prefix.trim() || 'video_walk'
+      const framesDir = joinPath(output, 'video_frames')
+      const canvas = document.createElement('canvas')
+
+      for (let index = 0; index < frameCount; index += 1) {
+        const sampleTime = start + usableDuration * (index / frameCount)
+        const safeTime = Math.min(Math.max(start, sampleTime), Math.max(start, end - 0.001))
+        setNotice(`Sampling video frame ${index + 1}/${frameCount}...`)
+        await seekVideo(video, safeTime)
+        await wait(20)
+        drawVideoFrame(video, canvas, frameWidth, frameHeight)
+        const bytes = await canvasToPngBytes(canvas)
+        const framePath = joinPath(framesDir, `${prefix}_${String(index).padStart(4, '0')}.png`)
+        await invoke('write_binary_file_gui', { path: framePath, bytes })
+      }
+
+      setNotice('Packing sampled frames...')
+      const nextReport = await invoke<SliceReport>('assemble_generated_loop_gui', {
+        options: {
+          input: framesDir,
+          output,
+          format: 'png',
+          dryRun: false,
+          columns,
+          prefix,
+          asepriteJson: true,
+          frameWidth,
+          frameHeight,
+        },
+      })
+      setSliceReport(nextReport)
+      setOptions((current) => ({ ...current, output }))
+      setSliceOptions((current) => ({
+        ...current,
+        input: joinPath(output, 'sheet.png'),
+        output,
+        prefix,
+        normalizeGenerated: true,
+        frameWidth,
+        frameHeight,
+      }))
+      const sheetPath = joinPath(output, 'sheet.png')
+      const preview = await invoke<string>('preview_image_data_url', { path: sheetPath })
+      setSheetPreview(preview)
+
+      const gifPath = joinPath(output, `${prefix}_preview.gif`)
+      const gif = await invoke<GifExportReport>('export_gif_gui', {
+        options: {
+          atlasPath: joinPath(output, 'atlas.json'),
+          sheetPath,
+          outputPath: gifPath,
+          animation: prefix,
+          fpsOverride: videoOptions.fps,
+          frameStart: null,
+          frameEnd: null,
+        },
+      })
+      const gifPreview = await invoke<string>('preview_image_data_url', { path: gif.outputPath })
+      setVideoPreviewGif(gifPreview)
+      const summary = `${frameCount} frames, ${columns} x ${rows}, ${usableDuration.toFixed(2)}s sampled`
+      setNotice(`Video sprite sheet: ${summary}`)
+      pushLog(`Video sprite sheet built from ${fileName(videoOptions.input)}: ${summary}.`)
+      pushLog(`Preview GIF: ${gif.outputPath}`)
+    } catch (error) {
+      const message = String(error)
+      setNotice(message)
+      pushLog(`Video extraction failed: ${message}`)
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -988,7 +1411,10 @@ function App() {
       })
       setSliceReport(nextReport)
       setReport(null)
-      const summary = `${nextReport.frameCount} frames from ${nextReport.sheetWidth} x ${nextReport.sheetHeight}`
+      const normalized = nextReport.normalization
+        ? `, normalized ${nextReport.normalization.outputFrameSize.w} x ${nextReport.normalization.outputFrameSize.h}`
+        : ''
+      const summary = `${nextReport.frameCount} frames from ${nextReport.sheetWidth} x ${nextReport.sheetHeight}${normalized}`
       setNotice(dryRun ? `Slice dry run: ${summary}` : `Sliced: ${summary}`)
       pushLog(`${dryRun ? 'Slice dry run' : 'Sliced'} ${summary}.`)
       if (!dryRun) {
@@ -1161,6 +1587,7 @@ function App() {
     setSliceReport(null)
     setSheetPreview('')
     setComparison(null)
+    setVideoPreviewGif('')
     setHotReloadSignature('')
     setNotice('Ready')
   }
@@ -1174,9 +1601,11 @@ function App() {
     <div className="app-shell theme-neko-tron">
       <header className="topbar">
         <div className="brand-lockup">
-          <div className="brand-icon">AP</div>
           <div>
-            <h1>Sprite Atlas Packer</h1>
+            <div className="brand-title-row">
+              <h1>Sprite Atlas Packer</h1>
+              <span className="version-badge">{APP_VERSION_LABEL}</span>
+            </div>
             <p>{notice}</p>
           </div>
         </div>
@@ -1424,9 +1853,17 @@ function App() {
               Remote
             </div>
             <label className="toggle-row">
-              {agentControl?.enabled ? <CheckCircle2 size={17} /> : <TriangleAlert size={17} />}
-              <span>{agentControl?.enabled ? 'AI Agent Remote Control On' : 'AI Agent Remote Control Off'}</span>
+              <input
+                type="checkbox"
+                checked={Boolean(agentControl?.enabled)}
+                onChange={(event) => void setAgentControlEnabled(event.currentTarget.checked)}
+              />
+              <span>AI Agent Control</span>
             </label>
+            <div className={classNames('remote-status', agentControl?.enabled && 'active')}>
+              {agentControl?.enabled ? <CheckCircle2 size={17} /> : <TriangleAlert size={17} />}
+              <span>{agentControl?.enabled ? 'API enabled for agents' : 'API disabled'}</span>
+            </div>
             <label className="field">
               <span>Address</span>
               <input value={agentControl?.baseUrl ?? 'http://127.0.0.1:9877/api/v1'} readOnly />
@@ -1435,21 +1872,173 @@ function App() {
               <span>Token</span>
               <input value={agentControl?.token ?? ''} readOnly />
             </label>
+            <button className="secondary-action full" type="button" onClick={() => void copyAgentToken()} disabled={!agentControl?.token}>
+              <FileJson size={16} />
+              Copy Token
+            </button>
+          </section>
+
+          <section className="panel-section">
+            <div className="section-title">
+              <Video size={16} />
+              Video
+            </div>
             <div className="folder-row">
-              <button className="secondary-action full" type="button" onClick={() => void toggleAgentControl()}>
-                <Radio size={16} />
-                {agentControl?.enabled ? 'Disable Remote' : 'Enable Remote'}
-              </button>
-              <button
-                className="icon-button compact"
-                type="button"
-                onClick={() => void copyAgentToken()}
-                disabled={!agentControl?.token}
-                title="Copy bearer token"
-              >
-                <FileJson size={15} />
+              <input value={compactPath(videoOptions.input)} readOnly />
+              <button className="icon-button compact" type="button" onClick={() => void chooseVideo()} title="Choose video">
+                <Video size={15} />
               </button>
             </div>
+            <div className="folder-row">
+              <input value={compactPath(videoOptions.output)} readOnly />
+              <button className="icon-button compact" type="button" onClick={() => void chooseVideoOutput()} title="Choose video output">
+                <FolderOpen size={15} />
+              </button>
+            </div>
+            {videoSourceUrl ? (
+              <video
+                className="video-source-preview"
+                controls
+                muted
+                playsInline
+                preload="auto"
+                ref={videoRef}
+                src={videoSourceUrl}
+                onLoadedMetadata={(event) => {
+                  const duration = Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0
+                  setVideoDuration(duration)
+                  setVideoOptions((current) => ({
+                    ...current,
+                    endTime: current.endTime > 0 && current.endTime <= duration ? current.endTime : duration,
+                  }))
+                }}
+              />
+            ) : (
+              <div className="video-source-empty">No video selected</div>
+            )}
+            <div className="format-toggle three">
+              {(['4x4', '5x5', 'custom'] as VideoGridPreset[]).map((gridPreset) => (
+                <button
+                  className={classNames('format-button', videoOptions.gridPreset === gridPreset && 'active')}
+                  key={gridPreset}
+                  type="button"
+                  onClick={() => setVideoGridPreset(gridPreset)}
+                >
+                  {gridPreset.toUpperCase()}
+                </button>
+              ))}
+            </div>
+            <div className="cell-grid">
+              <label>
+                <span>Columns</span>
+                <input
+                  min={1}
+                  max={16}
+                  type="number"
+                  value={videoOptions.columns}
+                  onChange={(event) =>
+                    setVideoOptions((current) => ({
+                      ...current,
+                      gridPreset: 'custom',
+                      columns: Math.max(1, Math.min(16, Number(event.currentTarget.value) || 1)),
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>Rows</span>
+                <input
+                  min={1}
+                  max={16}
+                  type="number"
+                  value={videoOptions.rows}
+                  onChange={(event) =>
+                    setVideoOptions((current) => ({
+                      ...current,
+                      gridPreset: 'custom',
+                      rows: Math.max(1, Math.min(16, Number(event.currentTarget.value) || 1)),
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>Frame W</span>
+                <input
+                  min={16}
+                  type="number"
+                  value={videoOptions.frameWidth}
+                  onChange={(event) => setVideoOptions((current) => ({ ...current, frameWidth: Math.max(16, Number(event.currentTarget.value) || 16) }))}
+                />
+              </label>
+              <label>
+                <span>Frame H</span>
+                <input
+                  min={16}
+                  type="number"
+                  value={videoOptions.frameHeight}
+                  onChange={(event) => setVideoOptions((current) => ({ ...current, frameHeight: Math.max(16, Number(event.currentTarget.value) || 16) }))}
+                />
+              </label>
+              <label>
+                <span>Start</span>
+                <input
+                  min={0}
+                  step={0.05}
+                  type="number"
+                  value={Number(videoOptions.startTime.toFixed(2))}
+                  onChange={(event) =>
+                    setVideoOptions((current) => ({
+                      ...current,
+                      startTime: Math.max(0, Number(event.currentTarget.value) || 0),
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>End</span>
+                <input
+                  min={0}
+                  step={0.05}
+                  type="number"
+                  value={Number(videoOptions.endTime.toFixed(2))}
+                  onChange={(event) =>
+                    setVideoOptions((current) => ({
+                      ...current,
+                      endTime: Math.max(0, Number(event.currentTarget.value) || 0),
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>FPS</span>
+                <input
+                  min={1}
+                  max={60}
+                  type="number"
+                  value={videoOptions.fps}
+                  onChange={(event) => setVideoOptions((current) => ({ ...current, fps: Math.max(1, Math.min(60, Number(event.currentTarget.value) || 1)) }))}
+                />
+              </label>
+              <label>
+                <span>Frames</span>
+                <input readOnly value={videoFrameCount} />
+              </label>
+            </div>
+            <label className="field">
+              <span>Prefix</span>
+              <input
+                value={videoOptions.prefix}
+                onChange={(event) => setVideoOptions((current) => ({ ...current, prefix: event.currentTarget.value }))}
+              />
+            </label>
+            <div className="video-range-note">
+              {videoDuration > 0 ? `${videoRangeSeconds.toFixed(2)}s sampled from ${videoDuration.toFixed(2)}s` : 'Duration loads after video selection'}
+            </div>
+            <button className="secondary-action full" type="button" onClick={() => void runVideoToSpriteSheet()} disabled={!videoOptions.input || busy}>
+              {busy ? <Loader2 className="spin" size={16} /> : <Grid3X3 size={16} />}
+              Make Sprite Sheet
+            </button>
+            {videoPreviewGif ? <img className="video-gif-preview" alt="Video animation preview" src={videoPreviewGif} /> : null}
           </section>
 
           <section className="panel-section">
@@ -1478,7 +2067,7 @@ function App() {
             {sliceOptions.mode === 'grid' ? (
               <div className="cell-grid">
                 <label>
-                  <span>W</span>
+                  <span>Cell W</span>
                   <input
                     min={1}
                     type="number"
@@ -1487,12 +2076,42 @@ function App() {
                   />
                 </label>
                 <label>
-                  <span>H</span>
+                  <span>Cell H</span>
                   <input
                     min={1}
                     type="number"
                     value={sliceOptions.cellHeight}
                     onChange={(event) => setSliceOptions((current) => ({ ...current, cellHeight: Math.max(1, Number(event.currentTarget.value) || 1) }))}
+                  />
+                </label>
+              </div>
+            ) : null}
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={sliceOptions.normalizeGenerated}
+                onChange={(event) => setSliceOptions((current) => ({ ...current, normalizeGenerated: event.currentTarget.checked }))}
+              />
+              <span>Normalize generated sheet</span>
+            </label>
+            {sliceOptions.normalizeGenerated ? (
+              <div className="cell-grid">
+                <label>
+                  <span>Frame W</span>
+                  <input
+                    min={16}
+                    type="number"
+                    value={sliceOptions.frameWidth}
+                    onChange={(event) => setSliceOptions((current) => ({ ...current, frameWidth: Math.max(16, Number(event.currentTarget.value) || 16) }))}
+                  />
+                </label>
+                <label>
+                  <span>Frame H</span>
+                  <input
+                    min={16}
+                    type="number"
+                    value={sliceOptions.frameHeight}
+                    onChange={(event) => setSliceOptions((current) => ({ ...current, frameHeight: Math.max(16, Number(event.currentTarget.value) || 16) }))}
                   />
                 </label>
               </div>

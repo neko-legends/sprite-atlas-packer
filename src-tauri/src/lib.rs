@@ -3,6 +3,7 @@ use image::{
     codecs::gif::{GifEncoder, Repeat},
     codecs::png::PngEncoder,
     codecs::webp::WebPEncoder,
+    imageops::{overlay, resize, FilterType},
     AnimationDecoder, ColorType, Delay, DynamicImage, GenericImageView, ImageDecoder, ImageEncoder,
     Rgba, RgbaImage,
 };
@@ -27,12 +28,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 #[cfg(feature = "desktop")]
+use tauri::Manager;
+#[cfg(feature = "desktop")]
 use tauri_plugin_opener::OpenerExt;
 use thiserror::Error;
 use walkdir::WalkDir;
 
 const APP_NAME: &str = "sprite-atlas-packer";
-const VERSION: &str = "1.0";
+const VERSION: &str = "26.6.19";
 const DEFAULT_DURATION_MS: u32 = 120;
 const DEFAULT_MAX_SIZE: u32 = 16384;
 const RASTER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
@@ -42,6 +45,22 @@ const ASEPRITE_BIN_ENV: &str = "SPRITE_ATLAS_PACKER_ASEPRITE_BIN";
 const AGENT_API_REGISTRY_FILE: &str = "agent-api-registry.json";
 const SAP_DEFAULT_PORT: u16 = 9877;
 const SAP_BIND_ADDRESS: &str = "127.0.0.1";
+#[cfg(feature = "desktop")]
+const DEFAULT_WINDOW_WIDTH: u32 = 1280;
+#[cfg(feature = "desktop")]
+const DEFAULT_WINDOW_HEIGHT: u32 = 820;
+#[cfg(feature = "desktop")]
+const MIN_WINDOW_WIDTH: u32 = 860;
+#[cfg(feature = "desktop")]
+const MIN_WINDOW_HEIGHT: u32 = 540;
+#[cfg(feature = "desktop")]
+const LANDSCAPE_WINDOW_WIDTH_RATIO: f64 = 0.5;
+#[cfg(feature = "desktop")]
+const PORTRAIT_WINDOW_WIDTH_RATIO: f64 = 0.9;
+const GENERATED_GRID_POLICY: &str =
+    "auto_detect_grid_from_sprite_distances_then_fallback_proportional";
+const GENERATED_PROPORTION_POLICY: &str = "global_uniform_scale_preserve_sprite_proportions";
+const GENERATED_ROOT_ANCHOR_POLICY: &str = "fixed_upper_body_centroid_anchor_position_stable";
 
 #[derive(Debug, Error)]
 pub enum AtlasError {
@@ -167,6 +186,20 @@ pub struct PackOptions {
     pub stable_pivot: bool,
     pub dedup_threshold: Option<u8>,
     pub linked_channels: Vec<String>,
+    pub normalize_generated: bool,
+    pub frame_size: Option<(u32, u32)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeneratedLoopOptions {
+    pub input: PathBuf,
+    pub output: PathBuf,
+    pub format: OutputFormat,
+    pub dry_run: bool,
+    pub columns: Option<u32>,
+    pub prefix: String,
+    pub aseprite_json: bool,
+    pub frame_size: Option<(u32, u32)>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -255,10 +288,6 @@ fn default_max_size() -> u32 {
     DEFAULT_MAX_SIZE
 }
 
-fn default_cell_size() -> u32 {
-    32
-}
-
 fn default_webp_format() -> String {
     "webp".to_string()
 }
@@ -277,6 +306,22 @@ fn default_grid_mode() -> String {
 
 fn default_frame_prefix() -> String {
     "frame".to_string()
+}
+
+fn default_generated_frame_size() -> u32 {
+    256
+}
+
+fn default_walk_frame_count() -> u32 {
+    16
+}
+
+fn default_cat_walk_action() -> String {
+    "cat_walk".to_string()
+}
+
+fn default_cat_walk_prefix() -> String {
+    "cat_walk".to_string()
 }
 
 #[derive(Debug, Default)]
@@ -324,6 +369,8 @@ impl Default for PackOptions {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         }
     }
 }
@@ -354,6 +401,41 @@ pub struct SliceReport {
     pub frames: Vec<String>,
     pub wrote: Vec<String>,
     pub atlas: Atlas,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalization: Option<SliceNormalizationReport>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SliceNormalizationReport {
+    pub source_sheet_size: Size,
+    pub output_sheet_size: Size,
+    pub output_frame_size: Size,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_columns: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_rows: Option<u32>,
+    pub source_cells: Vec<JsonRect>,
+    pub frame_bboxes: Vec<Option<JsonRect>>,
+    pub root_anchors: Vec<Option<Pivot>>,
+    pub scale: f32,
+    pub grid_policy: String,
+    pub grid_detection: String,
+    pub proportion_policy: String,
+    pub root_anchor_policy: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuity: Option<SliceContinuityReport>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SliceContinuityReport {
+    pub frame_count: usize,
+    pub protocol: String,
+    pub median_neighbor_delta: f32,
+    pub loop_delta: f32,
+    pub max_neighbor_delta: f32,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -432,15 +514,82 @@ pub struct GuiSliceOptions {
     pub format: String,
     #[serde(default = "default_grid_mode")]
     pub mode: String,
-    #[serde(default = "default_cell_size")]
+    #[serde(default)]
     pub cell_width: u32,
-    #[serde(default = "default_cell_size")]
+    #[serde(default)]
     pub cell_height: u32,
     #[serde(default = "default_frame_prefix")]
     pub prefix: String,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
+    pub aseprite_json: bool,
+    #[serde(default)]
+    pub normalize_generated: bool,
+    #[serde(default = "default_generated_frame_size")]
+    pub frame_width: u32,
+    #[serde(default = "default_generated_frame_size")]
+    pub frame_height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuiGeneratedLoopOptions {
+    pub input: String,
+    pub output: String,
+    #[serde(default = "default_png_format")]
+    pub format: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub columns: u32,
+    #[serde(default = "default_frame_prefix")]
+    pub prefix: String,
+    #[serde(default)]
+    pub aseprite_json: bool,
+    #[serde(default = "default_generated_frame_size")]
+    pub frame_width: u32,
+    #[serde(default = "default_generated_frame_size")]
+    pub frame_height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJobStartOptions {
+    pub output: String,
+    #[serde(default = "default_cat_walk_action")]
+    pub action: String,
+    #[serde(default = "default_walk_frame_count")]
+    pub frame_count: u32,
+    #[serde(default)]
+    pub columns: u32,
+    #[serde(default = "default_cat_walk_prefix")]
+    pub prefix: String,
+    #[serde(default = "default_generated_frame_size")]
+    pub frame_width: u32,
+    #[serde(default = "default_generated_frame_size")]
+    pub frame_height: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJobSubmitFrameOptions {
+    pub job_dir: String,
+    pub frame_index: usize,
+    pub source_path: String,
+    #[serde(default)]
+    pub force_accept: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJobAssembleOptions {
+    pub job_dir: String,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default = "default_png_format")]
+    pub format: String,
+    #[serde(default = "default_true")]
     pub aseprite_json: bool,
 }
 
@@ -463,6 +612,109 @@ pub struct GifExportReport {
     pub animation: String,
     pub frame_count: usize,
     pub encoder: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJob {
+    pub job_id: String,
+    pub action: String,
+    pub prefix: String,
+    pub frame_count: usize,
+    pub columns: u32,
+    pub frame_size: Size,
+    pub job_dir: String,
+    pub frames_dir: String,
+    pub candidates_dir: String,
+    pub validation_dir: String,
+    pub pose_guides_dir: String,
+    pub assembled_dir: String,
+    pub continuity_protocol: String,
+    pub prompt_contract: Vec<String>,
+    pub frames: Vec<AnimationFramePlan>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationFramePlan {
+    pub index: usize,
+    pub filename: String,
+    pub pose: String,
+    pub phase: f32,
+    pub foot_contacts: Vec<String>,
+    pub body_height: String,
+    pub pose_guide_path: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJobStartReport {
+    pub job: AnimationJob,
+    pub plan_path: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJobFrameAnalysis {
+    pub source_size: Size,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<JsonRect>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox_center: Option<Pivot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox_size: Option<Size>,
+    pub visible_pixels: u64,
+    pub green_edge_pixels: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<AnimationJobStyleStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gait: Option<AnimationJobGaitStats>,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJobStyleStats {
+    pub mean_r: f32,
+    pub mean_g: f32,
+    pub mean_b: f32,
+    pub mean_saturation: f32,
+    pub orange_ratio: f32,
+    pub cream_ratio: f32,
+    pub dark_ratio: f32,
+    pub silhouette_density: f32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJobGaitStats {
+    pub root_anchor: Pivot,
+    pub ground_y: f32,
+    pub contact_count: usize,
+    pub stance_width: f32,
+    pub contact_center_x: f32,
+    pub rear_contact_ratio: f32,
+    pub front_contact_ratio: f32,
+    pub lower_body_ratio: f32,
+    pub contact_points: Vec<Pivot>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AnimationJobFrameSubmitReport {
+    pub job_id: String,
+    pub frame_index: usize,
+    pub expected_pose: String,
+    pub accepted: bool,
+    pub forced: bool,
+    pub candidate_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_frame_path: Option<String>,
+    pub validation_path: String,
+    pub analysis: AnimationJobFrameAnalysis,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+    pub prompt: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -558,6 +810,21 @@ struct Rect {
     h: u32,
 }
 
+#[derive(Debug, Clone)]
+struct SliceDetection {
+    rects: Vec<Rect>,
+    columns: Option<u32>,
+    rows: Option<u32>,
+    grid_detection: String,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedSlice {
+    sheet: RgbaImage,
+    frame_rects: Vec<Rect>,
+    report: SliceNormalizationReport,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Atlas {
     pub meta: Meta,
@@ -639,15 +906,87 @@ pub fn run_cli(args: Vec<String>) -> Result<()> {
 }
 
 #[cfg(feature = "desktop")]
+fn clamp_window_dimension(value: u32, min: u32, monitor_max: u32) -> u32 {
+    let max = monitor_max.max(1);
+    value.max(min.min(max)).min(max)
+}
+
+#[cfg(feature = "desktop")]
+fn initial_window_size(monitor_width: u32, monitor_height: u32) -> tauri::PhysicalSize<u32> {
+    let width_ratio = if monitor_width < monitor_height {
+        PORTRAIT_WINDOW_WIDTH_RATIO
+    } else {
+        LANDSCAPE_WINDOW_WIDTH_RATIO
+    };
+    let aspect = DEFAULT_WINDOW_HEIGHT as f64 / DEFAULT_WINDOW_WIDTH as f64;
+    let mut width = (monitor_width as f64 * width_ratio).round();
+    let mut height = (width * aspect).round();
+    let max_height = (monitor_height as f64 * 0.9).round().max(1.0);
+
+    if height > max_height {
+        height = max_height;
+        width = (height / aspect).round();
+    }
+
+    tauri::PhysicalSize::new(width.max(1.0) as u32, height.max(1.0) as u32)
+}
+
+#[cfg(feature = "desktop")]
+fn apply_initial_window_size(app: &tauri::App) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let monitor_size = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .map(|monitor| *monitor.size());
+    let monitor_width = monitor_size
+        .as_ref()
+        .map(|size| size.width)
+        .unwrap_or(DEFAULT_WINDOW_WIDTH);
+    let monitor_height = monitor_size
+        .as_ref()
+        .map(|size| size.height)
+        .unwrap_or(DEFAULT_WINDOW_HEIGHT);
+    let size = initial_window_size(monitor_width, monitor_height);
+    let size = tauri::PhysicalSize::new(
+        clamp_window_dimension(size.width, MIN_WINDOW_WIDTH, monitor_width),
+        clamp_window_dimension(size.height, MIN_WINDOW_HEIGHT, monitor_height),
+    );
+
+    if let Err(error) = window.set_size(tauri::Size::Physical(size)) {
+        eprintln!("Failed to initialize window size: {error}");
+    }
+    let _ = window.center();
+}
+
+#[cfg(feature = "desktop")]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(GuiControlServerState::default())
+        .setup(|app| {
+            apply_initial_window_size(app);
+            let state = app.state::<GuiControlServerState>();
+            if let Err(error) = start_agent_control_server(&state) {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "control_error",
+                        "error": error,
+                    })
+                );
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             pack_atlas_gui,
             slice_sheet_gui,
+            assemble_generated_loop_gui,
             load_project_gui,
             save_project_gui,
             source_snapshot_gui,
@@ -705,6 +1044,8 @@ fn pack_atlas_gui(options: GuiPackOptions) -> std::result::Result<PackReport, St
         stable_pivot: options.stable_pivot,
         dedup_threshold: options.dedup_threshold,
         linked_channels: normalize_channel_suffixes(options.linked_channels),
+        normalize_generated: false,
+        frame_size: None,
     })
     .map_err(|error| error.to_string())
 }
@@ -745,8 +1086,19 @@ fn slice_sheet_gui(options: GuiSliceOptions) -> std::result::Result<SliceReport,
         stable_pivot: false,
         dedup_threshold: None,
         linked_channels: Vec::new(),
+        normalize_generated: options.normalize_generated,
+        frame_size: normalized_frame_size_option(options.frame_width, options.frame_height),
     })
     .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+fn assemble_generated_loop_gui(
+    options: GuiGeneratedLoopOptions,
+) -> std::result::Result<SliceReport, String> {
+    let options = generated_loop_options_from_gui(options).map_err(|error| error.to_string())?;
+    assemble_generated_loop(options).map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "desktop")]
@@ -785,6 +1137,8 @@ fn save_project_gui(path: String, options: GuiProjectOptions) -> std::result::Re
         stable_pivot: options.stable_pivot,
         dedup_threshold: options.dedup_threshold,
         linked_channels: normalize_channel_suffixes(options.linked_channels),
+        normalize_generated: false,
+        frame_size: None,
     };
     write_project_file(Path::new(&path), &pack_options).map_err(|error| error.to_string())
 }
@@ -861,7 +1215,13 @@ fn export_gif_gui(options: GuiGifExportOptions) -> std::result::Result<GifExport
 #[cfg(feature = "desktop")]
 #[tauri::command]
 fn write_binary_file_gui(path: String, bytes: Vec<u8>) -> std::result::Result<(), String> {
-    fs::write(Path::new(&path), bytes).map_err(|error| error.to_string())
+    let path = Path::new(&path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+    }
+    fs::write(path, bytes).map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "desktop")]
@@ -885,6 +1245,13 @@ fn agent_control_status_gui(
 #[tauri::command]
 fn start_agent_control_gui(
     state: tauri::State<'_, GuiControlServerState>,
+) -> std::result::Result<GuiControlServerInfo, String> {
+    start_agent_control_server(&state)
+}
+
+#[cfg(feature = "desktop")]
+fn start_agent_control_server(
+    state: &GuiControlServerState,
 ) -> std::result::Result<GuiControlServerInfo, String> {
     let mut server = state.server.lock().map_err(|error| error.to_string())?;
     if server.is_some() {
@@ -928,6 +1295,7 @@ fn stop_agent_control_gui(
     let mut server = state.server.lock().map_err(|error| error.to_string())?;
     if let Some(mut active) = server.take() {
         active.shutdown.store(true, AtomicOrdering::SeqCst);
+        let _ = TcpStream::connect(format!("{}:{}", active.config.host, active.config.port));
         if let Some(handle) = active.handle.take() {
             handle
                 .join()
@@ -1083,68 +1451,46 @@ pub fn slice_sheet(options: PackOptions) -> Result<SliceReport> {
     if options.output.as_os_str().is_empty() && !options.dry_run {
         return Err(AtlasError::Message("--output is required".to_string()));
     }
-    let image = decode_image(&options.input)?;
-    let rects = match mode {
-        SliceMode::Grid => detect_grid_rects(&image, options.cell)?,
-        SliceMode::Alpha => detect_alpha_components(&image),
+    let source_image = decode_image(&options.input)?;
+    let detection_image = if options.normalize_generated {
+        remove_generation_chroma_key(&source_image)
+    } else {
+        source_image.clone()
     };
-    if rects.is_empty() {
+    let detection = detect_slice_rects(
+        &detection_image,
+        mode,
+        options.cell,
+        options.normalize_generated,
+    )?;
+    if detection.rects.is_empty() {
         return Err(AtlasError::Message(
             "No frames detected in source sheet".to_string(),
         ));
     }
 
     let sheet_name = options.format.atlas_image_name().to_string();
-    let frames = rects
-        .iter()
-        .enumerate()
-        .map(|(index, rect)| {
-            let filename = format!("{}_{index:04}", options.prefix);
-            Frame {
-                filename,
-                frame: JsonRect {
-                    x: rect.x,
-                    y: rect.y,
-                    w: rect.w,
-                    h: rect.h,
-                },
-                rotated: false,
-                trimmed: false,
-                sprite_source_size: JsonRect {
-                    x: 0,
-                    y: 0,
-                    w: rect.w,
-                    h: rect.h,
-                },
-                source_size: Size {
-                    w: rect.w,
-                    h: rect.h,
-                },
-                pivot: Pivot { x: 0.5, y: 0.5 },
-                duration_ms: Some(DEFAULT_DURATION_MS),
-            }
-        })
-        .collect::<Vec<_>>();
-    let atlas = Atlas {
-        meta: Meta {
-            app: APP_NAME.to_string(),
-            version: VERSION.to_string(),
-            image: sheet_name.clone(),
-            size: Size {
-                w: image.width(),
-                h: image.height(),
-            },
-            format: "RGBA8888".to_string(),
-            scale: 1.0,
-            trimmed: false,
-        },
-        animations: vec![Animation {
-            name: options.prefix.clone(),
-            frames: frames.iter().map(|frame| frame.filename.clone()).collect(),
-            looped: true,
-            fps_hint: 1000.0 / DEFAULT_DURATION_MS as f32,
-        }],
-        frames,
+    let (sheet_image, atlas, normalization) = if options.normalize_generated {
+        let normalized = normalize_generated_slice(&detection_image, &detection, &options)?;
+        let atlas = slice_atlas(
+            &sheet_name,
+            &options.prefix,
+            normalized.sheet.width(),
+            normalized.sheet.height(),
+            &normalized.frame_rects,
+            Pivot { x: 0.5, y: 0.305 },
+        );
+        (normalized.sheet, atlas, Some(normalized.report))
+    } else {
+        let atlas = slice_atlas(
+            &sheet_name,
+            &options.prefix,
+            source_image.width(),
+            source_image.height(),
+            &detection.rects,
+            Pivot { x: 0.5, y: 0.5 },
+        );
+        (source_image, atlas, None)
     };
 
     let mut wrote = Vec::new();
@@ -1152,22 +1498,22 @@ pub fn slice_sheet(options: PackOptions) -> Result<SliceReport> {
         fs::create_dir_all(options.output.join("frames"))?;
         match options.format {
             OutputFormat::Webp => {
-                write_webp(&options.output.join("sheet.webp"), &image)?;
+                write_webp(&options.output.join("sheet.webp"), &sheet_image)?;
                 wrote.push("sheet.webp".to_string());
             }
             OutputFormat::Png => {
-                write_png(&options.output.join("sheet.png"), &image)?;
+                write_png(&options.output.join("sheet.png"), &sheet_image)?;
                 wrote.push("sheet.png".to_string());
             }
             OutputFormat::Both => {
-                write_webp(&options.output.join("sheet.webp"), &image)?;
-                write_png(&options.output.join("sheet.png"), &image)?;
+                write_webp(&options.output.join("sheet.webp"), &sheet_image)?;
+                write_png(&options.output.join("sheet.png"), &sheet_image)?;
                 wrote.push("sheet.webp".to_string());
                 wrote.push("sheet.png".to_string());
             }
         }
         for frame in &atlas.frames {
-            let cropped = image
+            let cropped = sheet_image
                 .view(frame.frame.x, frame.frame.y, frame.frame.w, frame.frame.h)
                 .to_image();
             write_png(
@@ -1189,12 +1535,20 @@ pub fn slice_sheet(options: PackOptions) -> Result<SliceReport> {
             write_aseprite_json(&options.output.join("aseprite.json"), &atlas)?;
             wrote.push("aseprite.json".to_string());
         }
+        if let Some(normalization) = &normalization {
+            let json = serde_json::to_string_pretty(normalization)?;
+            write_text_if_changed(
+                &options.output.join("spritesheet_normalization.json"),
+                &format!("{json}\n"),
+            )?;
+            wrote.push("spritesheet_normalization.json".to_string());
+        }
     }
 
     Ok(SliceReport {
         frame_count: atlas.frames.len(),
-        sheet_width: image.width(),
-        sheet_height: image.height(),
+        sheet_width: sheet_image.width(),
+        sheet_height: sheet_image.height(),
         frames: atlas
             .frames
             .iter()
@@ -1202,6 +1556,376 @@ pub fn slice_sheet(options: PackOptions) -> Result<SliceReport> {
             .collect(),
         wrote,
         atlas,
+        normalization,
+    })
+}
+
+pub fn assemble_generated_loop(options: GeneratedLoopOptions) -> Result<SliceReport> {
+    if options.input.as_os_str().is_empty() {
+        return Err(AtlasError::Message(
+            "Generated loop input folder is required".to_string(),
+        ));
+    }
+    if options.output.as_os_str().is_empty() && !options.dry_run {
+        return Err(AtlasError::Message("--output is required".to_string()));
+    }
+    let sources = load_sources(&options.input, false)?;
+    if sources.is_empty() {
+        return Err(AtlasError::Message(
+            "No generated frame images found in input folder".to_string(),
+        ));
+    }
+
+    let columns = generated_loop_columns(sources.len(), options.columns)?;
+    let rows = ceil_div_u32(sources.len() as u32, columns).max(1);
+    let cell_w = sources
+        .iter()
+        .map(|source| source.image.width())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let cell_h = sources
+        .iter()
+        .map(|source| source.image.height())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let sheet_w = cell_w.checked_mul(columns).ok_or_else(|| {
+        AtlasError::Message("Generated loop source sheet width would overflow".to_string())
+    })?;
+    let sheet_h = cell_h.checked_mul(rows).ok_or_else(|| {
+        AtlasError::Message("Generated loop source sheet height would overflow".to_string())
+    })?;
+    let mut source_sheet = RgbaImage::from_pixel(sheet_w, sheet_h, Rgba([0, 0, 0, 0]));
+    let mut rects = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
+        let column = index as u32 % columns;
+        let row = index as u32 / columns;
+        let x = column * cell_w;
+        let y = row * cell_h;
+        let cleaned = remove_generation_chroma_key(&source.image);
+        let offset_x = x + (cell_w - cleaned.width()) / 2;
+        let offset_y = y + (cell_h - cleaned.height()) / 2;
+        overlay(
+            &mut source_sheet,
+            &cleaned,
+            offset_x as i64,
+            offset_y as i64,
+        );
+        rects.push(Rect {
+            x,
+            y,
+            w: cell_w,
+            h: cell_h,
+        });
+    }
+
+    let detection = SliceDetection {
+        rects,
+        columns: Some(columns),
+        rows: Some(rows),
+        grid_detection: format!(
+            "individual_generated_frames_sorted:{}_frames:{}x{}",
+            sources.len(),
+            columns,
+            rows
+        ),
+    };
+    let normalizer_options = PackOptions {
+        input: options.input.clone(),
+        output: options.output.clone(),
+        format: options.format,
+        packing_strategy: PackingStrategy::MaxRects,
+        pot: true,
+        padding: 0,
+        max_size: DEFAULT_MAX_SIZE,
+        rotate: false,
+        trim: false,
+        dry_run: options.dry_run,
+        watch: false,
+        slice_mode: Some(SliceMode::Grid),
+        cell: Some((cell_w, cell_h)),
+        prefix: options.prefix.clone(),
+        aseprite_json: options.aseprite_json,
+        godot_spriteframes: false,
+        unity_importer: false,
+        animation_regex: None,
+        animations: Vec::new(),
+        stable_pivot: false,
+        dedup_threshold: None,
+        linked_channels: Vec::new(),
+        normalize_generated: true,
+        frame_size: options.frame_size,
+    };
+    let normalized = normalize_generated_slice(&source_sheet, &detection, &normalizer_options)?;
+    let sheet_name = options.format.atlas_image_name().to_string();
+    let atlas = slice_atlas(
+        &sheet_name,
+        &options.prefix,
+        normalized.sheet.width(),
+        normalized.sheet.height(),
+        &normalized.frame_rects,
+        Pivot { x: 0.5, y: 0.305 },
+    );
+    let sheet_image = normalized.sheet;
+    let normalization = Some(normalized.report);
+
+    let mut wrote = Vec::new();
+    if !options.dry_run {
+        fs::create_dir_all(options.output.join("frames"))?;
+        match options.format {
+            OutputFormat::Webp => {
+                write_webp(&options.output.join("sheet.webp"), &sheet_image)?;
+                wrote.push("sheet.webp".to_string());
+            }
+            OutputFormat::Png => {
+                write_png(&options.output.join("sheet.png"), &sheet_image)?;
+                wrote.push("sheet.png".to_string());
+            }
+            OutputFormat::Both => {
+                write_webp(&options.output.join("sheet.webp"), &sheet_image)?;
+                write_png(&options.output.join("sheet.png"), &sheet_image)?;
+                wrote.push("sheet.webp".to_string());
+                wrote.push("sheet.png".to_string());
+            }
+        }
+        for frame in &atlas.frames {
+            let cropped = sheet_image
+                .view(frame.frame.x, frame.frame.y, frame.frame.w, frame.frame.h)
+                .to_image();
+            write_png(
+                &options
+                    .output
+                    .join("frames")
+                    .join(format!("{}.png", frame.filename)),
+                &cropped,
+            )?;
+        }
+        wrote.push("frames/*.png".to_string());
+        let atlas_json = serde_json::to_string_pretty(&atlas)?;
+        write_text_if_changed(
+            &options.output.join("atlas.json"),
+            &format!("{atlas_json}\n"),
+        )?;
+        wrote.push("atlas.json".to_string());
+        if options.aseprite_json {
+            write_aseprite_json(&options.output.join("aseprite.json"), &atlas)?;
+            wrote.push("aseprite.json".to_string());
+        }
+        if let Some(normalization) = &normalization {
+            let json = serde_json::to_string_pretty(normalization)?;
+            write_text_if_changed(
+                &options.output.join("spritesheet_normalization.json"),
+                &format!("{json}\n"),
+            )?;
+            wrote.push("spritesheet_normalization.json".to_string());
+        }
+    }
+
+    Ok(SliceReport {
+        frame_count: atlas.frames.len(),
+        sheet_width: sheet_image.width(),
+        sheet_height: sheet_image.height(),
+        frames: atlas
+            .frames
+            .iter()
+            .map(|frame| frame.filename.clone())
+            .collect(),
+        wrote,
+        atlas,
+        normalization,
+    })
+}
+
+pub fn start_animation_job(options: AnimationJobStartOptions) -> Result<AnimationJobStartReport> {
+    let action = if options.action.trim().is_empty() {
+        default_cat_walk_action()
+    } else {
+        options.action.trim().to_ascii_lowercase()
+    };
+    if action != "cat_walk" {
+        return Err(AtlasError::Message(format!(
+            "Unsupported animation job action: {action}. Supported action: cat_walk"
+        )));
+    }
+    let frame_count = options.frame_count as usize;
+    if !matches!(frame_count, 8 | 16) {
+        return Err(AtlasError::Message(
+            "Cat walk jobs currently support 8 or 16 frames".to_string(),
+        ));
+    }
+    let frame_size = Size {
+        w: options.frame_width.max(16),
+        h: options.frame_height.max(16),
+    };
+    let columns = generated_loop_columns(
+        frame_count,
+        (options.columns > 0).then_some(options.columns),
+    )?;
+    let job_dir = PathBuf::from(options.output);
+    if job_dir.as_os_str().is_empty() {
+        return Err(AtlasError::Message(
+            "Animation job output folder is required".to_string(),
+        ));
+    }
+    let frames_dir = job_dir.join("accepted_frames");
+    let candidates_dir = job_dir.join("candidates");
+    let validation_dir = job_dir.join("validation");
+    let pose_guides_dir = job_dir.join("pose_guides");
+    let assembled_dir = job_dir.join("assembled");
+    fs::create_dir_all(&frames_dir)?;
+    fs::create_dir_all(&candidates_dir)?;
+    fs::create_dir_all(&validation_dir)?;
+    fs::create_dir_all(&pose_guides_dir)?;
+    fs::create_dir_all(&assembled_dir)?;
+
+    let job_id = generate_animation_job_id();
+    let prefix = if options.prefix.trim().is_empty() {
+        default_cat_walk_prefix()
+    } else {
+        options.prefix
+    };
+    let frames = cat_walk_frame_plan(frame_count, frame_size, &pose_guides_dir)?;
+    let job = AnimationJob {
+        job_id,
+        action,
+        prefix,
+        frame_count,
+        columns,
+        frame_size,
+        job_dir: job_dir.to_string_lossy().to_string(),
+        frames_dir: frames_dir.to_string_lossy().to_string(),
+        candidates_dir: candidates_dir.to_string_lossy().to_string(),
+        validation_dir: validation_dir.to_string_lossy().to_string(),
+        pose_guides_dir: pose_guides_dir.to_string_lossy().to_string(),
+        assembled_dir: assembled_dir.to_string_lossy().to_string(),
+        continuity_protocol:
+            "cat_walk_frame_at_a_time_pose_guides_validate_regenerate_then_assemble".to_string(),
+        prompt_contract: vec![
+            "Use the locked cat identity reference for every frame".to_string(),
+            "Follow the exact pose guide for the requested frame".to_string(),
+            "Keep same side-view camera, scale, body length, head size, tail style, palette, and full-body framing".to_string(),
+            "Use transparent background, or a thin dark neutral gray matte/separator only".to_string(),
+            "Make planted front/hind paws visibly contact one stable invisible ground line".to_string(),
+            "Keep the upper-body/root anchor locked; only legs, paws, tail, and subtle body height should change".to_string(),
+            "Do not duplicate frame 1 as the final frame; frame 16 must be the in-between before frame 1".to_string(),
+        ],
+        frames,
+    };
+    let plan_path = animation_job_plan_path(&job_dir);
+    write_animation_job(&plan_path, &job)?;
+    Ok(AnimationJobStartReport {
+        job,
+        plan_path: plan_path.to_string_lossy().to_string(),
+    })
+}
+
+pub fn submit_animation_job_frame(
+    options: AnimationJobSubmitFrameOptions,
+) -> Result<AnimationJobFrameSubmitReport> {
+    let job_dir = PathBuf::from(options.job_dir);
+    let plan_path = animation_job_plan_path(&job_dir);
+    let job = read_animation_job(&plan_path)?;
+    if options.frame_index >= job.frame_count {
+        return Err(AtlasError::Message(format!(
+            "Frame index {} is outside this {} frame job",
+            options.frame_index, job.frame_count
+        )));
+    }
+    let source_path = PathBuf::from(&options.source_path);
+    if !source_path.exists() {
+        return Err(AtlasError::Message(format!(
+            "Generated frame does not exist: {}",
+            source_path.display()
+        )));
+    }
+    let frame_plan = job.frames[options.frame_index].clone();
+    let candidates_dir = PathBuf::from(&job.candidates_dir);
+    let validation_dir = PathBuf::from(&job.validation_dir);
+    let frames_dir = PathBuf::from(&job.frames_dir);
+    fs::create_dir_all(&candidates_dir)?;
+    fs::create_dir_all(&validation_dir)?;
+    fs::create_dir_all(&frames_dir)?;
+
+    let extension = source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("png");
+    let candidate_path = candidates_dir.join(format!(
+        "{:03}_candidate.{}",
+        options.frame_index,
+        extension.to_ascii_lowercase()
+    ));
+    fs::copy(&source_path, &candidate_path)?;
+    let analysis = analyze_animation_frame(&candidate_path)?;
+    let accepted_analyses = accepted_frame_analyses(&job, Some(options.frame_index))?;
+    let (mut errors, warnings) =
+        validate_animation_frame(&job, &frame_plan, &analysis, &accepted_analyses);
+    let forced = options.force_accept && !errors.is_empty();
+    let accepted = errors.is_empty() || options.force_accept;
+    let saved_frame_path = if accepted {
+        let destination = frames_dir.join(&frame_plan.filename);
+        fs::copy(&candidate_path, &destination)?;
+        Some(destination.to_string_lossy().to_string())
+    } else {
+        None
+    };
+    if forced {
+        errors.push("Frame was force-accepted despite validation errors".to_string());
+    }
+
+    let validation_path = validation_dir.join(format!("{:03}.json", options.frame_index));
+    let report = AnimationJobFrameSubmitReport {
+        job_id: job.job_id,
+        frame_index: options.frame_index,
+        expected_pose: frame_plan.pose,
+        accepted,
+        forced,
+        candidate_path: candidate_path.to_string_lossy().to_string(),
+        saved_frame_path,
+        validation_path: validation_path.to_string_lossy().to_string(),
+        analysis,
+        errors,
+        warnings,
+        prompt: frame_plan.prompt,
+    };
+    write_text_if_changed(
+        &validation_path,
+        &format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    Ok(report)
+}
+
+pub fn assemble_animation_job(options: AnimationJobAssembleOptions) -> Result<SliceReport> {
+    let job_dir = PathBuf::from(options.job_dir);
+    let job = read_animation_job(&animation_job_plan_path(&job_dir))?;
+    let frames_dir = PathBuf::from(&job.frames_dir);
+    let missing = job
+        .frames
+        .iter()
+        .filter(|frame| !frames_dir.join(&frame.filename).exists())
+        .map(|frame| format!("{}:{}", frame.index, frame.filename))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(AtlasError::Message(format!(
+            "Cannot assemble yet; missing accepted frames: {}",
+            missing.join(", ")
+        )));
+    }
+    let output = options
+        .output
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&job.assembled_dir));
+    assemble_generated_loop(GeneratedLoopOptions {
+        input: frames_dir,
+        output,
+        format: OutputFormat::parse(&options.format)?,
+        dry_run: false,
+        columns: Some(job.columns),
+        prefix: job.prefix,
+        aseprite_json: options.aseprite_json,
+        frame_size: Some((job.frame_size.w, job.frame_size.h)),
     })
 }
 
@@ -1852,6 +2576,17 @@ fn parse_args(args: Vec<String>) -> Result<PackOptions> {
                 index += 1;
                 options.prefix = require_value(&args, index, "--prefix")?.to_string();
             }
+            "--normalize-generated" | "--normalize" => {
+                options.normalize_generated = true;
+            }
+            "--no-normalize-generated" => {
+                options.normalize_generated = false;
+            }
+            "--frame-size" => {
+                index += 1;
+                options.frame_size =
+                    Some(parse_cell(require_value(&args, index, "--frame-size")?)?);
+            }
             value if value.starts_with('-') => {
                 return Err(AtlasError::Message(format!("Unknown option: {value}")));
             }
@@ -1949,9 +2684,6 @@ fn run_control_listener(
     listener: TcpListener,
     shutdown: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
-    if shutdown.is_some() {
-        listener.set_nonblocking(true)?;
-    }
     let state = Arc::new(Mutex::new(ControlState::default()));
     let event_clients: EventClients = Arc::new(Mutex::new(Vec::new()));
     loop {
@@ -2015,7 +2747,9 @@ fn gui_control_server_info(server: Option<&GuiControlServer>) -> GuiControlServe
                 "http://{}:{}/api/v1",
                 server.config.host, server.config.port
             ),
-            discovery_file: control_discovery_path().to_string_lossy().to_string(),
+            discovery_file: control_discovery_display_path()
+                .to_string_lossy()
+                .to_string(),
         }
     } else {
         GuiControlServerInfo {
@@ -2024,16 +2758,14 @@ fn gui_control_server_info(server: Option<&GuiControlServer>) -> GuiControlServe
             port: 9877,
             token: String::new(),
             base_url: "http://127.0.0.1:9877/api/v1".to_string(),
-            discovery_file: control_discovery_path().to_string_lossy().to_string(),
+            discovery_file: control_discovery_display_path()
+                .to_string_lossy()
+                .to_string(),
         }
     }
 }
 
 fn write_control_discovery(config: &ServeConfig) -> Result<()> {
-    let path = control_discovery_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let value = serde_json::json!({
         "app": APP_NAME,
         "host": config.host,
@@ -2042,12 +2774,30 @@ fn write_control_discovery(config: &ServeConfig) -> Result<()> {
         "baseUrl": format!("http://{}:{}/api/v1", config.host, config.port),
         "eventsUrl": format!("ws://{}:{}/api/v1/events?token={}", config.host, config.port, config.token),
     });
-    write_text_if_changed(
-        &path,
-        &format!("{}\n", serde_json::to_string_pretty(&value)?),
-    )?;
-    register_agent_api(config, false, None);
-    Ok(())
+    let payload = format!("{}\n", serde_json::to_string_pretty(&value)?);
+    let mut last_error = None;
+    let mut wrote_any = false;
+    for path in control_discovery_paths() {
+        let write_result = (|| -> Result<()> {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            write_text_if_changed(&path, &payload)
+        })();
+        match write_result {
+            Ok(()) => {
+                wrote_any = true;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if wrote_any {
+        register_agent_api(config, false, None);
+        return Ok(());
+    }
+    Err(last_error.unwrap_or_else(|| {
+        AtlasError::Message("Unable to write control discovery file".to_string())
+    }))
 }
 
 fn control_discovery_path() -> PathBuf {
@@ -2073,6 +2823,24 @@ fn control_discovery_path() -> PathBuf {
         }
         PathBuf::from("control-api.json")
     }
+}
+
+fn control_discovery_paths() -> Vec<PathBuf> {
+    let mut paths = vec![control_discovery_path()];
+    if let Ok(current_dir) = std::env::current_dir() {
+        let fallback = current_dir.join("control-api.json");
+        if !paths.iter().any(|path| path == &fallback) {
+            paths.push(fallback);
+        }
+    }
+    paths
+}
+
+fn control_discovery_display_path() -> PathBuf {
+    control_discovery_paths()
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(control_discovery_path)
 }
 
 fn agent_api_registry_path() -> Option<PathBuf> {
@@ -2131,7 +2899,9 @@ where
             Err(error) => return Err(error.into()),
         }
     }
-    Err(AtlasError::Message("Agent API registry is busy.".to_string()))
+    Err(AtlasError::Message(
+        "Agent API registry is busy.".to_string(),
+    ))
 }
 
 fn register_agent_api(config: &ServeConfig, busy: bool, active_job_id: Option<String>) {
@@ -2141,7 +2911,11 @@ fn register_agent_api(config: &ServeConfig, busy: bool, active_job_id: Option<St
     let _ = with_registry_lock(&path, || {
         let mut registry = read_registry_value(&path);
         registry["updatedAt"] = serde_json::json!(registry_timestamp());
-        if !registry.get("apps").map(serde_json::Value::is_array).unwrap_or(false) {
+        if !registry
+            .get("apps")
+            .map(serde_json::Value::is_array)
+            .unwrap_or(false)
+        {
             registry["apps"] = serde_json::json!([]);
         }
         let url = format!("http://{}:{}", config.host, config.port);
@@ -2159,7 +2933,10 @@ fn register_agent_api(config: &ServeConfig, busy: bool, active_job_id: Option<St
             "lastSeen": registry_timestamp(),
             "note": "Pack/slice control API."
         });
-        if let Some(apps) = registry.get_mut("apps").and_then(serde_json::Value::as_array_mut) {
+        if let Some(apps) = registry
+            .get_mut("apps")
+            .and_then(serde_json::Value::as_array_mut)
+        {
             if let Some(existing) = apps.iter_mut().find(|candidate| {
                 candidate
                     .get("appId")
@@ -2289,6 +3066,102 @@ fn handle_control_connection(
             );
             write_http_json(&mut stream, 200, &report)
         }
+        ("POST", "/api/v1/animation-job/start") => {
+            let options: AnimationJobStartOptions = serde_json::from_slice(&request.body)?;
+            let report = start_animation_job(options)?;
+            write_http_json(&mut stream, 200, &report)
+        }
+        ("POST", "/api/v1/animation-job/submit-frame") => {
+            let options: AnimationJobSubmitFrameOptions = serde_json::from_slice(&request.body)?;
+            let report = submit_animation_job_frame(options)?;
+            write_http_json(&mut stream, 200, &report)
+        }
+        ("POST", "/api/v1/animation-job/assemble") => {
+            let gui: AnimationJobAssembleOptions = serde_json::from_slice(&request.body)?;
+            let output = gui
+                .output
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(&gui.job_dir).join("assembled"));
+            let format = OutputFormat::parse(&gui.format)?;
+            let sheet_path = output.join(format.atlas_image_name());
+            let report = assemble_animation_job(gui)?;
+            let sheet_path = sheet_path.to_string_lossy().to_string();
+            let output = output.to_string_lossy().to_string();
+            {
+                let mut state = state
+                    .lock()
+                    .map_err(|error| AtlasError::Message(error.to_string()))?;
+                state.last_atlas = Some(report.atlas.clone());
+                state.last_sheet_path = Some(sheet_path.clone());
+                state.last_output = Some(output.clone());
+                state.last_slice = Some(report.clone());
+            }
+            broadcast_control_event(
+                event_clients,
+                &serde_json::json!({
+                    "type": "animationJobAssemble",
+                    "atlas": report.atlas.clone(),
+                    "sheetPath": sheet_path,
+                    "outputPath": output,
+                    "wrote": report.wrote.clone(),
+                }),
+            );
+            write_http_json(&mut stream, 200, &report)
+        }
+        ("POST", "/api/v1/assemble-generated-loop") => {
+            let gui: GuiGeneratedLoopOptions = serde_json::from_slice(&request.body)?;
+            let options = generated_loop_options_from_gui(gui)?;
+            let sheet_path = options.output.join(options.format.atlas_image_name());
+            let output = options.output.clone();
+            let report = assemble_generated_loop(options)?;
+            let sheet_path = sheet_path.to_string_lossy().to_string();
+            let output = output.to_string_lossy().to_string();
+            {
+                let mut state = state
+                    .lock()
+                    .map_err(|error| AtlasError::Message(error.to_string()))?;
+                state.last_atlas = Some(report.atlas.clone());
+                state.last_sheet_path = Some(sheet_path.clone());
+                state.last_output = Some(output.clone());
+                state.last_slice = Some(report.clone());
+            }
+            broadcast_control_event(
+                event_clients,
+                &serde_json::json!({
+                    "type": "assembleGeneratedLoop",
+                    "atlas": report.atlas.clone(),
+                    "sheetPath": sheet_path,
+                    "outputPath": output,
+                    "wrote": report.wrote.clone(),
+                }),
+            );
+            write_http_json(&mut stream, 200, &report)
+        }
+        ("POST", "/api/v1/export-gif") => {
+            let gui: GuiGifExportOptions = serde_json::from_slice(&request.body)?;
+            let report = export_gif(
+                Path::new(&gui.atlas_path),
+                Path::new(&gui.sheet_path),
+                Path::new(&gui.output_path),
+                &gui.animation,
+                gui.fps_override,
+                gui.frame_start,
+                gui.frame_end,
+            )?;
+            broadcast_control_event(
+                event_clients,
+                &serde_json::json!({
+                    "type": "exportGif",
+                    "outputPath": report.output_path.clone(),
+                    "animation": report.animation.clone(),
+                    "frameCount": report.frame_count,
+                    "encoder": report.encoder.clone(),
+                }),
+            );
+            write_http_json(&mut stream, 200, &report)
+        }
         _ => write_http_json(
             &mut stream,
             404,
@@ -2309,6 +3182,11 @@ fn control_openapi_json() -> serde_json::Value {
             "/api/v1/atlas": { "get": { "summary": "Last atlas result" } },
             "/api/v1/pack": { "post": { "summary": "Pack sprites into an atlas" } },
             "/api/v1/slice": { "post": { "summary": "Slice a sprite sheet into frames" } },
+            "/api/v1/animation-job/start": { "post": { "summary": "Start an agent-directed frame-by-frame animation job" } },
+            "/api/v1/animation-job/submit-frame": { "post": { "summary": "Submit and validate one generated animation frame" } },
+            "/api/v1/animation-job/assemble": { "post": { "summary": "Assemble accepted animation job frames" } },
+            "/api/v1/assemble-generated-loop": { "post": { "summary": "Normalize separate generated frames into one loop spritesheet" } },
+            "/api/v1/export-gif": { "post": { "summary": "Export an animation preview GIF" } },
             "/api/v1/events": { "get": { "summary": "Event stream" } }
         }
     })
@@ -2351,6 +3229,8 @@ fn pack_options_from_gui(options: GuiPackOptions) -> Result<PackOptions> {
         stable_pivot: options.stable_pivot,
         dedup_threshold: options.dedup_threshold,
         linked_channels: normalize_channel_suffixes(options.linked_channels),
+        normalize_generated: false,
+        frame_size: None,
     })
 }
 
@@ -2388,6 +3268,27 @@ fn slice_options_from_gui(options: GuiSliceOptions) -> Result<PackOptions> {
         stable_pivot: false,
         dedup_threshold: None,
         linked_channels: Vec::new(),
+        normalize_generated: options.normalize_generated,
+        frame_size: normalized_frame_size_option(options.frame_width, options.frame_height),
+    })
+}
+
+fn generated_loop_options_from_gui(
+    options: GuiGeneratedLoopOptions,
+) -> Result<GeneratedLoopOptions> {
+    Ok(GeneratedLoopOptions {
+        input: PathBuf::from(options.input),
+        output: PathBuf::from(options.output),
+        format: OutputFormat::parse(&options.format)?,
+        dry_run: options.dry_run,
+        columns: (options.columns > 0).then_some(options.columns),
+        prefix: if options.prefix.trim().is_empty() {
+            "frame".to_string()
+        } else {
+            options.prefix
+        },
+        aseprite_json: options.aseprite_json,
+        frame_size: normalized_frame_size_option(options.frame_width, options.frame_height),
     })
 }
 
@@ -2938,7 +3839,9 @@ fn print_help() {
            --token <token>          Control API bearer token, generated by default\n\
            --slice grid|alpha       Reverse mode: slice an existing sheet\n\
            --cell <w>x<h>           Grid cell size for --slice grid\n\
-           --prefix <name>          Frame filename prefix for reverse mode"
+           --prefix <name>          Frame filename prefix for reverse mode\n\
+           --normalize-generated    Reverse mode: clean and stabilize generated sheets\n\
+           --frame-size <w>x<h>     Normalized output frame size, default 256x256"
     );
 }
 
@@ -3062,18 +3965,114 @@ fn valid_pivot(pivot: Pivot) -> bool {
     (0.0..=1.0).contains(&pivot.x) && (0.0..=1.0).contains(&pivot.y)
 }
 
-fn detect_grid_rects(image: &RgbaImage, cell: Option<(u32, u32)>) -> Result<Vec<Rect>> {
-    let (cell_w, cell_h) = match cell {
-        Some(cell) => cell,
-        None => autodetect_grid_cell(image).ok_or_else(|| {
-            AtlasError::Message("Unable to auto-detect grid; provide --cell <w>x<h>".to_string())
-        })?,
+fn slice_atlas(
+    sheet_name: &str,
+    prefix: &str,
+    sheet_width: u32,
+    sheet_height: u32,
+    rects: &[Rect],
+    pivot: Pivot,
+) -> Atlas {
+    let frames = rects
+        .iter()
+        .enumerate()
+        .map(|(index, rect)| {
+            let filename = format!("{prefix}_{index:04}");
+            Frame {
+                filename,
+                frame: json_rect(*rect),
+                rotated: false,
+                trimmed: false,
+                sprite_source_size: JsonRect {
+                    x: 0,
+                    y: 0,
+                    w: rect.w,
+                    h: rect.h,
+                },
+                source_size: Size {
+                    w: rect.w,
+                    h: rect.h,
+                },
+                pivot,
+                duration_ms: Some(DEFAULT_DURATION_MS),
+            }
+        })
+        .collect::<Vec<_>>();
+    Atlas {
+        meta: Meta {
+            app: APP_NAME.to_string(),
+            version: VERSION.to_string(),
+            image: sheet_name.to_string(),
+            size: Size {
+                w: sheet_width,
+                h: sheet_height,
+            },
+            format: "RGBA8888".to_string(),
+            scale: 1.0,
+            trimmed: false,
+        },
+        animations: vec![Animation {
+            name: prefix.to_string(),
+            frames: frames.iter().map(|frame| frame.filename.clone()).collect(),
+            looped: true,
+            fps_hint: 1000.0 / DEFAULT_DURATION_MS as f32,
+        }],
+        frames,
+    }
+}
+
+fn detect_slice_rects(
+    image: &RgbaImage,
+    mode: SliceMode,
+    cell: Option<(u32, u32)>,
+    normalize_generated: bool,
+) -> Result<SliceDetection> {
+    match mode {
+        SliceMode::Grid if normalize_generated => detect_generated_grid_rects(image, cell),
+        SliceMode::Grid => {
+            let (cell_w, cell_h, grid_detection) = resolve_grid_cell(image, cell)?;
+            Ok(SliceDetection {
+                rects: grid_rects_from_cell(image, cell_w, cell_h),
+                columns: Some(image.width() / cell_w),
+                rows: Some(image.height() / cell_h),
+                grid_detection,
+            })
+        }
+        SliceMode::Alpha => Ok(SliceDetection {
+            rects: detect_alpha_components(image),
+            columns: None,
+            rows: None,
+            grid_detection: "alpha_components".to_string(),
+        }),
+    }
+}
+
+fn resolve_grid_cell(image: &RgbaImage, cell: Option<(u32, u32)>) -> Result<(u32, u32, String)> {
+    let (cell_w, cell_h, detection) = match cell {
+        Some((cell_w, cell_h)) => (cell_w, cell_h, "explicit_cell".to_string()),
+        None => {
+            let (cell_w, cell_h) = autodetect_grid_cell(image).ok_or_else(|| {
+                AtlasError::Message(
+                    "Unable to auto-detect grid; provide --cell <w>x<h>".to_string(),
+                )
+            })?;
+            (cell_w, cell_h, "transparent_gutter_auto_cell".to_string())
+        }
     };
     if cell_w == 0 || cell_h == 0 || cell_w > image.width() || cell_h > image.height() {
         return Err(AtlasError::Message(
             "Grid cell dimensions must fit inside the sheet".to_string(),
         ));
     }
+    if image.width() / cell_w == 0 || image.height() / cell_h == 0 {
+        return Err(AtlasError::Message(
+            "Grid cell dimensions do not produce any source cells".to_string(),
+        ));
+    }
+    Ok((cell_w, cell_h, detection))
+}
+
+fn grid_rects_from_cell(image: &RgbaImage, cell_w: u32, cell_h: u32) -> Vec<Rect> {
     let mut rects = Vec::new();
     let columns = image.width() / cell_w;
     let rows = image.height() / cell_h;
@@ -3090,7 +4089,140 @@ fn detect_grid_rects(image: &RgbaImage, cell: Option<(u32, u32)>) -> Result<Vec<
             }
         }
     }
-    Ok(rects)
+    rects
+}
+
+fn detect_generated_grid_rects(
+    image: &RgbaImage,
+    cell: Option<(u32, u32)>,
+) -> Result<SliceDetection> {
+    let (columns, rows, source_detection) = resolve_generated_grid(image, cell)?;
+    let (x_bounds, y_bounds, projection_detection) = projected_grid_bounds(image, columns, rows);
+    let rects = grid_rects_from_bounds(image, &x_bounds, &y_bounds);
+    Ok(SliceDetection {
+        rects,
+        columns: Some(columns),
+        rows: Some(rows),
+        grid_detection: format!("{source_detection}:{projection_detection}"),
+    })
+}
+
+fn resolve_generated_grid(
+    image: &RgbaImage,
+    cell: Option<(u32, u32)>,
+) -> Result<(u32, u32, String)> {
+    if let Some((cell_w, cell_h)) = cell {
+        if cell_w == 0 || cell_h == 0 || cell_w > image.width() || cell_h > image.height() {
+            return Err(AtlasError::Message(
+                "Grid cell dimensions must fit inside the sheet".to_string(),
+            ));
+        }
+        let columns = rounded_grid_count(image.width(), cell_w);
+        let rows = rounded_grid_count(image.height(), cell_h);
+        if columns == 0 || rows == 0 {
+            return Err(AtlasError::Message(
+                "Grid cell dimensions do not produce any source cells".to_string(),
+            ));
+        }
+        let exact = image.width() % cell_w == 0 && image.height() % cell_h == 0;
+        let detection = if exact {
+            "explicit_cell_exact_grid"
+        } else {
+            "explicit_cell_approx_grid"
+        };
+        return Ok((columns, rows, detection.to_string()));
+    }
+
+    if let Some((columns, rows, detection)) = infer_generated_grid_size(image) {
+        return Ok((columns, rows, detection));
+    }
+
+    if let Some((cell_w, cell_h)) = autodetect_grid_cell(image) {
+        let columns = image.width() / cell_w;
+        let rows = image.height() / cell_h;
+        if columns > 0 && rows > 0 {
+            return Ok((columns, rows, "transparent_gutter_auto_cell".to_string()));
+        }
+    }
+
+    Err(AtlasError::Message(
+        "Unable to infer generated grid; provide --cell <w>x<h> or use a common generated layout such as 4x4 or 4x3".to_string(),
+    ))
+}
+
+fn rounded_grid_count(size: u32, cell: u32) -> u32 {
+    if cell == 0 {
+        return 0;
+    }
+    ((size as u64 + cell as u64 / 2) / cell as u64)
+        .max(1)
+        .min(u32::MAX as u64) as u32
+}
+
+fn infer_generated_grid_size(image: &RgbaImage) -> Option<(u32, u32, String)> {
+    let width = image.width();
+    let height = image.height();
+    if width < 128 || height < 128 {
+        return None;
+    }
+    let image_ratio = width as f32 / height as f32;
+    let candidates = [
+        (4, 4),
+        (4, 3),
+        (3, 4),
+        (5, 4),
+        (4, 5),
+        (6, 4),
+        (4, 6),
+        (8, 4),
+        (4, 8),
+        (8, 2),
+        (2, 8),
+    ];
+    candidates
+        .iter()
+        .map(|(columns, rows)| {
+            let candidate_ratio = *columns as f32 / *rows as f32;
+            let score = (image_ratio - candidate_ratio).abs() / candidate_ratio;
+            (score, *columns, *rows)
+        })
+        .filter(|(score, _, _)| *score <= 0.18)
+        .min_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal))
+        .map(|(_, columns, rows)| {
+            (
+                columns,
+                rows,
+                format!("inferred_generated_{columns}x{rows}"),
+            )
+        })
+}
+
+fn grid_rects_from_bounds(image: &RgbaImage, x_bounds: &[u32], y_bounds: &[u32]) -> Vec<Rect> {
+    let mut rects = Vec::new();
+    if x_bounds.len() < 2 || y_bounds.len() < 2 {
+        return rects;
+    }
+    for row in 0..y_bounds.len() - 1 {
+        for column in 0..x_bounds.len() - 1 {
+            let x0 = x_bounds[column].min(image.width());
+            let x1 = x_bounds[column + 1].min(image.width());
+            let y0 = y_bounds[row].min(image.height());
+            let y1 = y_bounds[row + 1].min(image.height());
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let rect = Rect {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0,
+            };
+            if rect_has_visible_alpha(image, rect) {
+                rects.push(rect);
+            }
+        }
+    }
+    rects
 }
 
 fn autodetect_grid_cell(image: &RgbaImage) -> Option<(u32, u32)> {
@@ -3125,6 +4257,143 @@ fn first_repeating_span(gutters: &[u32], limit: u32) -> Option<u32> {
         })
         .collect::<Vec<_>>();
     spans.into_iter().find(|span| *span > 1)
+}
+
+fn projected_grid_bounds(
+    image: &RgbaImage,
+    columns: u32,
+    rows: u32,
+) -> (Vec<u32>, Vec<u32>, String) {
+    let x_counts = (0..image.width())
+        .map(|x| {
+            (0..image.height())
+                .filter(|&y| image.get_pixel(x, y)[3] > 24)
+                .count() as u32
+        })
+        .collect::<Vec<_>>();
+    let y_counts = (0..image.height())
+        .map(|y| {
+            (0..image.width())
+                .filter(|&x| image.get_pixel(x, y)[3] > 24)
+                .count() as u32
+        })
+        .collect::<Vec<_>>();
+    let x_runs = projection_runs(
+        &x_counts,
+        (image.height() * 6 / 1000).max(3),
+        (image.width() / 160).max(6),
+        (image.width() / 80).max(12),
+    );
+    let y_runs = projection_runs(
+        &y_counts,
+        (image.width() * 6 / 1000).max(3),
+        (image.height() / 160).max(6),
+        (image.height() / 80).max(12),
+    );
+    let x_bounds = boundaries_from_runs(&x_runs, columns, image.width());
+    let y_bounds = boundaries_from_runs(&y_runs, rows, image.height());
+    if let (Some(x_bounds), Some(y_bounds)) = (x_bounds, y_bounds) {
+        return (x_bounds, y_bounds, "projection_auto_detected".to_string());
+    }
+    (
+        proportional_bounds(image.width(), columns),
+        proportional_bounds(image.height(), rows),
+        "projection_proportional_fallback".to_string(),
+    )
+}
+
+fn projection_runs(
+    counts: &[u32],
+    threshold: u32,
+    merge_gap: u32,
+    min_size: u32,
+) -> Vec<(u32, u32)> {
+    let mut runs = Vec::new();
+    let mut start: Option<u32> = None;
+    for (index, value) in counts.iter().enumerate() {
+        let index = index as u32;
+        if *value > threshold && start.is_none() {
+            start = Some(index);
+        } else if *value <= threshold {
+            if let Some(run_start) = start.take() {
+                runs.push((run_start, index));
+            }
+        }
+    }
+    if let Some(run_start) = start {
+        runs.push((run_start, counts.len() as u32));
+    }
+
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for run in runs {
+        if let Some(previous) = merged.last_mut() {
+            if run.0.saturating_sub(previous.1) <= merge_gap {
+                previous.1 = run.1;
+                continue;
+            }
+        }
+        merged.push(run);
+    }
+    merged
+        .into_iter()
+        .filter(|(start, end)| end.saturating_sub(*start) >= min_size)
+        .collect()
+}
+
+fn boundaries_from_runs(runs: &[(u32, u32)], expected: u32, size: u32) -> Option<Vec<u32>> {
+    if runs.len() != expected as usize || expected == 0 {
+        return None;
+    }
+    if expected == 1 {
+        return Some(vec![0, size]);
+    }
+    let centers = runs
+        .iter()
+        .map(|(start, end)| (*start as f32 + *end as f32) / 2.0)
+        .collect::<Vec<_>>();
+    let distances = centers
+        .windows(2)
+        .map(|window| window[1] - window[0])
+        .collect::<Vec<_>>();
+    let median_distance = median_f32(&distances)?;
+    if median_distance <= 0.0 {
+        return None;
+    }
+    let mut bounds = vec![(centers[0] - median_distance / 2.0).round() as i64];
+    for window in centers.windows(2) {
+        bounds.push(((window[0] + window[1]) / 2.0).round() as i64);
+    }
+    bounds.push((centers[centers.len() - 1] + median_distance / 2.0).round() as i64);
+    if let Some(first) = bounds.first_mut() {
+        *first = (*first).clamp(0, size as i64);
+    }
+    if let Some(last) = bounds.last_mut() {
+        *last = (*last).clamp(0, size as i64);
+    }
+    if bounds.windows(2).any(|window| window[1] <= window[0]) {
+        return None;
+    }
+    Some(bounds.into_iter().map(|value| value as u32).collect())
+}
+
+fn median_f32(values: &[f32]) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut values = values.to_vec();
+    values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Some((values[middle - 1] + values[middle]) / 2.0)
+    } else {
+        Some(values[middle])
+    }
+}
+
+fn proportional_bounds(size: u32, count: u32) -> Vec<u32> {
+    (0..=count)
+        .map(|index| ((index as u64 * size as u64 + count as u64 / 2) / count as u64) as u32)
+        .collect()
 }
 
 fn detect_alpha_components(image: &RgbaImage) -> Vec<Rect> {
@@ -3202,6 +4471,1392 @@ fn rect_has_alpha(image: &RgbaImage, rect: Rect) -> bool {
         }
     }
     false
+}
+
+fn rect_has_visible_alpha(image: &RgbaImage, rect: Rect) -> bool {
+    for y in rect.y..rect.y + rect.h {
+        for x in rect.x..rect.x + rect.w {
+            if image.get_pixel(x, y)[3] > 24 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn normalize_generated_slice(
+    image: &RgbaImage,
+    detection: &SliceDetection,
+    options: &PackOptions,
+) -> Result<NormalizedSlice> {
+    let (frame_w, frame_h) = normalized_frame_size(options.frame_size, &detection.rects)?;
+    let columns = detection
+        .columns
+        .filter(|columns| *columns > 0)
+        .unwrap_or_else(|| ceil_sqrt_u32(detection.rects.len() as u32).max(1));
+    let rows = ceil_div_u32(detection.rects.len() as u32, columns).max(1);
+    let sheet_w = frame_w
+        .checked_mul(columns)
+        .ok_or_else(|| AtlasError::Message("Normalized sheet width would overflow".to_string()))?;
+    let sheet_h = frame_h
+        .checked_mul(rows)
+        .ok_or_else(|| AtlasError::Message("Normalized sheet height would overflow".to_string()))?;
+
+    let mut cells = Vec::new();
+    let mut boxes = Vec::new();
+    let mut anchors = Vec::new();
+    let mut source_cells = Vec::new();
+    for rect in &detection.rects {
+        let source_rect = inset_rect(*rect);
+        let mut cell = image
+            .view(source_rect.x, source_rect.y, source_rect.w, source_rect.h)
+            .to_image();
+        remove_border_connected_generated_matte(&mut cell);
+        decontaminate_transparent_edges(&mut cell);
+        let bbox = alpha_bbox(&cell);
+        let anchor = bbox.map(|bbox| upper_body_anchor(&cell, bbox));
+        cells.push(cell);
+        boxes.push(bbox);
+        anchors.push(anchor);
+        source_cells.push(json_rect(source_rect));
+    }
+
+    let valid_boxes = boxes.iter().flatten().copied().collect::<Vec<_>>();
+    if valid_boxes.is_empty() {
+        return Err(AtlasError::Message(
+            "No visible sprite pixels found after generated-sheet cleanup".to_string(),
+        ));
+    }
+    let max_w = valid_boxes.iter().map(|rect| rect.w).max().unwrap_or(1);
+    let max_h = valid_boxes.iter().map(|rect| rect.h).max().unwrap_or(1);
+    let usable_w = frame_w.saturating_sub(12).max(1);
+    let usable_h = frame_h.saturating_sub(12).max(1);
+    let scale = (usable_w as f32 / max_w.max(1) as f32)
+        .min(usable_h as f32 / max_h.max(1) as f32)
+        .max(0.001);
+    let target_anchor = (frame_w as f32 / 2.0, frame_h as f32 * 0.305);
+    let mut sheet = RgbaImage::from_pixel(sheet_w, sheet_h, Rgba([0, 0, 0, 0]));
+    let mut frame_rects = Vec::new();
+    let mut frame_bboxes = Vec::new();
+    let mut root_anchors = Vec::new();
+
+    for (index, ((cell, bbox), anchor)) in cells
+        .iter()
+        .zip(boxes.iter())
+        .zip(anchors.iter())
+        .enumerate()
+    {
+        let column = index as u32 % columns;
+        let row = index as u32 / columns;
+        let frame_rect = Rect {
+            x: column * frame_w,
+            y: row * frame_h,
+            w: frame_w,
+            h: frame_h,
+        };
+        frame_rects.push(frame_rect);
+        let Some(bbox) = bbox else {
+            frame_bboxes.push(None);
+            root_anchors.push(None);
+            continue;
+        };
+        let Some(anchor) = anchor else {
+            frame_bboxes.push(None);
+            root_anchors.push(None);
+            continue;
+        };
+
+        let sprite = cell.view(bbox.x, bbox.y, bbox.w, bbox.h).to_image();
+        let scaled_w = ((bbox.w as f32 * scale).round() as u32).max(1);
+        let scaled_h = ((bbox.h as f32 * scale).round() as u32).max(1);
+        let sprite = resize(&sprite, scaled_w, scaled_h, FilterType::Lanczos3);
+        let anchor_x = (anchor.0 - bbox.x as f32) * scale;
+        let anchor_y = (anchor.1 - bbox.y as f32) * scale;
+        let mut local_x = (target_anchor.0 - anchor_x).round() as i64;
+        let mut local_y = (target_anchor.1 - anchor_y).round() as i64;
+        if scaled_w <= frame_w.saturating_sub(8) {
+            local_x = local_x.clamp(4, frame_w.saturating_sub(scaled_w + 4) as i64);
+        } else {
+            local_x = (frame_w as i64 - scaled_w as i64) / 2;
+        }
+        if scaled_h <= frame_h.saturating_sub(8) {
+            local_y = local_y.clamp(4, frame_h.saturating_sub(scaled_h + 4) as i64);
+        } else {
+            local_y = (frame_h as i64 - scaled_h as i64) / 2;
+        }
+        let paste_x = frame_rect.x as i64 + local_x;
+        let paste_y = frame_rect.y as i64 + local_y;
+        overlay(&mut sheet, &sprite, paste_x, paste_y);
+        frame_bboxes.push(Some(JsonRect {
+            x: local_x.max(0) as u32,
+            y: local_y.max(0) as u32,
+            w: scaled_w,
+            h: scaled_h,
+        }));
+        root_anchors.push(Some(Pivot {
+            x: target_anchor.0 / frame_w as f32,
+            y: target_anchor.1 / frame_h as f32,
+        }));
+    }
+
+    decontaminate_transparent_edges(&mut sheet);
+    decontaminate_transparent_edges(&mut sheet);
+    let continuity = generated_loop_continuity_report(&sheet, &frame_rects);
+
+    Ok(NormalizedSlice {
+        sheet,
+        frame_rects,
+        report: SliceNormalizationReport {
+            source_sheet_size: Size {
+                w: image.width(),
+                h: image.height(),
+            },
+            output_sheet_size: Size {
+                w: sheet_w,
+                h: sheet_h,
+            },
+            output_frame_size: Size {
+                w: frame_w,
+                h: frame_h,
+            },
+            source_columns: detection.columns,
+            source_rows: detection.rows,
+            source_cells,
+            frame_bboxes,
+            root_anchors,
+            scale,
+            grid_policy: GENERATED_GRID_POLICY.to_string(),
+            grid_detection: detection.grid_detection.clone(),
+            proportion_policy: GENERATED_PROPORTION_POLICY.to_string(),
+            root_anchor_policy: GENERATED_ROOT_ANCHOR_POLICY.to_string(),
+            continuity,
+        },
+    })
+}
+
+fn normalized_frame_size(frame_size: Option<(u32, u32)>, rects: &[Rect]) -> Result<(u32, u32)> {
+    let (width, height) = frame_size.unwrap_or_else(|| {
+        let width = rects.iter().map(|rect| rect.w).max().unwrap_or(256);
+        let height = rects.iter().map(|rect| rect.h).max().unwrap_or(256);
+        (width.max(1), height.max(1))
+    });
+    if width < 16 || height < 16 {
+        return Err(AtlasError::Message(
+            "Normalized frame size must be at least 16x16".to_string(),
+        ));
+    }
+    Ok((width, height))
+}
+
+fn normalized_frame_size_option(width: u32, height: u32) -> Option<(u32, u32)> {
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn inset_rect(rect: Rect) -> Rect {
+    let inset = ((rect.w.min(rect.h) as f32 * 0.01).round() as u32)
+        .max(1)
+        .min(rect.w.saturating_sub(1) / 2)
+        .min(rect.h.saturating_sub(1) / 2);
+    Rect {
+        x: rect.x + inset,
+        y: rect.y + inset,
+        w: rect.w.saturating_sub(inset * 2).max(1),
+        h: rect.h.saturating_sub(inset * 2).max(1),
+    }
+}
+
+fn alpha_bbox(image: &RgbaImage) -> Option<Rect> {
+    let mut min_x = image.width();
+    let mut min_y = image.height();
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found = false;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] > 24 {
+            found = true;
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+    }
+    found.then_some(Rect {
+        x: min_x,
+        y: min_y,
+        w: max_x - min_x + 1,
+        h: max_y - min_y + 1,
+    })
+}
+
+fn upper_body_anchor(image: &RgbaImage, bbox: Rect) -> (f32, f32) {
+    let upper_y1 = bbox.y + ((bbox.h as f32 * 0.58).round() as u32).max(1);
+    let mut xs = 0.0;
+    let mut ys = 0.0;
+    let mut total = 0.0;
+    for y in bbox.y..upper_y1.min(bbox.y + bbox.h) {
+        for x in bbox.x..bbox.x + bbox.w {
+            let alpha = image.get_pixel(x, y)[3] as f32;
+            if alpha > 24.0 {
+                xs += x as f32 * alpha;
+                ys += y as f32 * alpha;
+                total += alpha;
+            }
+        }
+    }
+    if total > 0.0 {
+        (xs / total, ys / total)
+    } else {
+        (
+            bbox.x as f32 + bbox.w as f32 / 2.0,
+            bbox.y as f32 + bbox.h as f32 * 0.32,
+        )
+    }
+}
+
+fn ceil_div_u32(value: u32, divisor: u32) -> u32 {
+    if divisor == 0 {
+        0
+    } else {
+        value.div_ceil(divisor)
+    }
+}
+
+fn ceil_sqrt_u32(value: u32) -> u32 {
+    if value <= 1 {
+        return value;
+    }
+    let mut side = 1;
+    while side * side < value {
+        side += 1;
+    }
+    side
+}
+
+fn generated_loop_columns(frame_count: usize, requested: Option<u32>) -> Result<u32> {
+    if frame_count == 0 {
+        return Err(AtlasError::Message(
+            "Generated loop must contain at least one frame".to_string(),
+        ));
+    }
+    if let Some(columns) = requested.filter(|columns| *columns > 0) {
+        if columns as usize > frame_count {
+            return Err(AtlasError::Message(
+                "Generated loop column count cannot exceed frame count".to_string(),
+            ));
+        }
+        return Ok(columns);
+    }
+    Ok(if frame_count <= 4 {
+        frame_count as u32
+    } else {
+        4
+    })
+}
+
+fn generate_animation_job_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("anim-{}-{nanos:x}", std::process::id())
+}
+
+fn animation_job_plan_path(job_dir: &Path) -> PathBuf {
+    job_dir.join("animation_job.json")
+}
+
+fn read_animation_job(path: &Path) -> Result<AnimationJob> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn write_animation_job(path: &Path, job: &AnimationJob) -> Result<()> {
+    write_text_if_changed(path, &format!("{}\n", serde_json::to_string_pretty(job)?))
+}
+
+#[derive(Debug, Clone)]
+struct AnimationPoseSpec {
+    pose: &'static str,
+    foot_contacts: &'static [&'static str],
+    body_height: &'static str,
+}
+
+fn cat_walk_frame_plan(
+    frame_count: usize,
+    frame_size: Size,
+    pose_guides_dir: &Path,
+) -> Result<Vec<AnimationFramePlan>> {
+    let specs = cat_walk_specs(frame_count)?;
+    let mut frames = Vec::new();
+    for (index, spec) in specs.iter().enumerate() {
+        let filename = format!("{index:03}_{}.png", slugify(spec.pose));
+        let guide_path = pose_guides_dir.join(format!("{index:03}_{}.svg", slugify(spec.pose)));
+        write_cat_pose_guide(&guide_path, frame_size, index, frame_count, spec)?;
+        frames.push(AnimationFramePlan {
+            index,
+            filename,
+            pose: spec.pose.to_string(),
+            phase: index as f32 / frame_count as f32,
+            foot_contacts: spec
+                .foot_contacts
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            body_height: spec.body_height.to_string(),
+            pose_guide_path: guide_path.to_string_lossy().to_string(),
+            prompt: cat_walk_frame_prompt(index, frame_count, spec, &guide_path),
+        });
+    }
+    Ok(frames)
+}
+
+fn cat_walk_specs(frame_count: usize) -> Result<Vec<AnimationPoseSpec>> {
+    let specs = match frame_count {
+        8 => vec![
+            AnimationPoseSpec {
+                pose: "contact_left_front_right_hind",
+                foot_contacts: &["left_front", "right_hind"],
+                body_height: "neutral",
+            },
+            AnimationPoseSpec {
+                pose: "down_weight_transfer",
+                foot_contacts: &["left_front", "right_hind", "left_hind"],
+                body_height: "low",
+            },
+            AnimationPoseSpec {
+                pose: "passing_left_front_lift",
+                foot_contacts: &["right_front", "left_hind"],
+                body_height: "neutral",
+            },
+            AnimationPoseSpec {
+                pose: "up_reach_before_opposite_contact",
+                foot_contacts: &["right_front", "left_hind"],
+                body_height: "high",
+            },
+            AnimationPoseSpec {
+                pose: "opposite_contact_right_front_left_hind",
+                foot_contacts: &["right_front", "left_hind"],
+                body_height: "neutral",
+            },
+            AnimationPoseSpec {
+                pose: "opposite_down_weight_transfer",
+                foot_contacts: &["right_front", "left_hind", "right_hind"],
+                body_height: "low",
+            },
+            AnimationPoseSpec {
+                pose: "opposite_passing_right_front_lift",
+                foot_contacts: &["left_front", "right_hind"],
+                body_height: "neutral",
+            },
+            AnimationPoseSpec {
+                pose: "final_inbetween_before_contact",
+                foot_contacts: &["left_front", "right_hind"],
+                body_height: "high",
+            },
+        ],
+        16 => vec![
+            AnimationPoseSpec {
+                pose: "contact_left_front_right_hind",
+                foot_contacts: &["left_front", "right_hind"],
+                body_height: "neutral",
+            },
+            AnimationPoseSpec {
+                pose: "inbetween_settle_into_contact",
+                foot_contacts: &["left_front", "right_hind"],
+                body_height: "slightly_low",
+            },
+            AnimationPoseSpec {
+                pose: "down_weight_transfer",
+                foot_contacts: &["left_front", "right_hind", "left_hind"],
+                body_height: "low",
+            },
+            AnimationPoseSpec {
+                pose: "inbetween_left_front_lift",
+                foot_contacts: &["right_front", "left_hind", "right_hind"],
+                body_height: "slightly_low",
+            },
+            AnimationPoseSpec {
+                pose: "passing_left_front_lift",
+                foot_contacts: &["right_front", "left_hind"],
+                body_height: "neutral",
+            },
+            AnimationPoseSpec {
+                pose: "inbetween_reach_forward",
+                foot_contacts: &["right_front", "left_hind"],
+                body_height: "slightly_high",
+            },
+            AnimationPoseSpec {
+                pose: "up_reach_before_opposite_contact",
+                foot_contacts: &["right_front", "left_hind"],
+                body_height: "high",
+            },
+            AnimationPoseSpec {
+                pose: "inbetween_pre_opposite_contact",
+                foot_contacts: &["right_front", "left_hind"],
+                body_height: "slightly_high",
+            },
+            AnimationPoseSpec {
+                pose: "opposite_contact_right_front_left_hind",
+                foot_contacts: &["right_front", "left_hind"],
+                body_height: "neutral",
+            },
+            AnimationPoseSpec {
+                pose: "opposite_inbetween_settle",
+                foot_contacts: &["right_front", "left_hind"],
+                body_height: "slightly_low",
+            },
+            AnimationPoseSpec {
+                pose: "opposite_down_weight_transfer",
+                foot_contacts: &["right_front", "left_hind", "right_hind"],
+                body_height: "low",
+            },
+            AnimationPoseSpec {
+                pose: "opposite_inbetween_right_front_lift",
+                foot_contacts: &["left_front", "right_hind", "left_hind"],
+                body_height: "slightly_low",
+            },
+            AnimationPoseSpec {
+                pose: "opposite_passing_right_front_lift",
+                foot_contacts: &["left_front", "right_hind"],
+                body_height: "neutral",
+            },
+            AnimationPoseSpec {
+                pose: "opposite_inbetween_reach_forward",
+                foot_contacts: &["left_front", "right_hind"],
+                body_height: "slightly_high",
+            },
+            AnimationPoseSpec {
+                pose: "opposite_up_reach_before_contact",
+                foot_contacts: &["left_front", "right_hind"],
+                body_height: "high",
+            },
+            AnimationPoseSpec {
+                pose: "final_inbetween_before_contact",
+                foot_contacts: &["left_front", "right_hind"],
+                body_height: "slightly_high",
+            },
+        ],
+        _ => {
+            return Err(AtlasError::Message(
+                "Cat walk pose guides support 8 or 16 frames".to_string(),
+            ))
+        }
+    };
+    Ok(specs)
+}
+
+fn cat_walk_frame_prompt(
+    index: usize,
+    frame_count: usize,
+    spec: &AnimationPoseSpec,
+    guide_path: &Path,
+) -> String {
+    format!(
+        "Generate frame {}/{} for a side-view cat walk cycle. Pose: {}. Paw contacts: {}. Body height: {}. Use the locked cat reference plus pose guide {}. Keep identical character identity, scale, body length, head size, tail style, palette, side-view camera, and full-body framing. Plant the listed front/hind paws on one stable invisible ground line with readable paw spacing; keep the upper-body/root anchor locked while only legs, paws, tail, and subtle body height change. Transparent background preferred; if a separator/matte is needed use thin dark neutral gray #2b2f36. This is one frame of a loop; do not duplicate the first frame unless explicitly requested.",
+        index + 1,
+        frame_count,
+        spec.pose,
+        spec.foot_contacts.join(", "),
+        spec.body_height,
+        guide_path.display()
+    )
+}
+
+fn write_cat_pose_guide(
+    path: &Path,
+    size: Size,
+    index: usize,
+    frame_count: usize,
+    spec: &AnimationPoseSpec,
+) -> Result<()> {
+    let w = size.w.max(128) as f32;
+    let h = size.h.max(128) as f32;
+    let phase = index as f32 / frame_count as f32 * std::f32::consts::TAU;
+    let body_y_offset = match spec.body_height {
+        "low" => h * 0.035,
+        "slightly_low" => h * 0.018,
+        "high" => -h * 0.028,
+        "slightly_high" => -h * 0.014,
+        _ => 0.0,
+    };
+    let ground_y = h * 0.78;
+    let body_cx = w * 0.50;
+    let body_cy = h * 0.49 + body_y_offset;
+    let body_w = w * 0.46;
+    let body_h = h * 0.18;
+    let head_cx = body_cx + body_w * 0.42;
+    let head_cy = body_cy - body_h * 0.22;
+    let stride = w * 0.075;
+    let lift = h * 0.09;
+    let legs = [
+        (
+            "left_hind",
+            body_cx - body_w * 0.30,
+            phase + std::f32::consts::FRAC_PI_2,
+        ),
+        (
+            "right_hind",
+            body_cx - body_w * 0.12,
+            phase + std::f32::consts::PI * 1.5,
+        ),
+        ("left_front", body_cx + body_w * 0.18, phase),
+        (
+            "right_front",
+            body_cx + body_w * 0.34,
+            phase + std::f32::consts::PI,
+        ),
+    ];
+    let mut leg_svg = String::new();
+    for (name, hip_x, leg_phase) in legs {
+        let swing = leg_phase.sin();
+        let contact = spec.foot_contacts.iter().any(|contact| *contact == name);
+        let paw_x = hip_x + swing * stride;
+        let paw_y = if contact {
+            ground_y
+        } else {
+            ground_y - swing.max(0.0).abs() * lift - h * 0.025
+        };
+        let color = if contact { "#0f766e" } else { "#6b7280" };
+        leg_svg.push_str(&format!(
+            r#"<line x1="{hip_x:.1}" y1="{:.1}" x2="{paw_x:.1}" y2="{paw_y:.1}" stroke="{color}" stroke-width="3" stroke-linecap="round"/><circle cx="{paw_x:.1}" cy="{paw_y:.1}" r="4" fill="{color}"><title>{name}</title></circle>"#,
+            body_cy + body_h * 0.42
+        ));
+    }
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0}" height="{h:.0}" viewBox="0 0 {w:.0} {h:.0}">
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<line x1="{:.1}" y1="{ground_y:.1}" x2="{:.1}" y2="{ground_y:.1}" stroke="#94a3b8" stroke-width="2" stroke-dasharray="6 6"/>
+<ellipse cx="{body_cx:.1}" cy="{body_cy:.1}" rx="{:.1}" ry="{:.1}" fill="none" stroke="#111827" stroke-width="4"/>
+<circle cx="{head_cx:.1}" cy="{head_cy:.1}" r="{:.1}" fill="none" stroke="#111827" stroke-width="4"/>
+<path d="M {:.1} {:.1} C {:.1} {:.1}, {:.1} {:.1}, {:.1} {:.1}" fill="none" stroke="#111827" stroke-width="4" stroke-linecap="round"/>
+{leg_svg}
+<text x="12" y="22" font-family="Arial" font-size="14" fill="#111827">{}</text>
+<text x="12" y="42" font-family="Arial" font-size="12" fill="#475569">contacts: {}</text>
+</svg>
+"##,
+        w * 0.08,
+        w * 0.92,
+        body_w / 2.0,
+        body_h / 2.0,
+        body_h * 0.62,
+        body_cx - body_w * 0.48,
+        body_cy - body_h * 0.1,
+        body_cx - body_w * 0.65,
+        body_cy - body_h * 0.45,
+        body_cx - body_w * 0.72,
+        body_cy + body_h * 0.15,
+        body_cx - body_w * 0.56,
+        body_cy + body_h * 0.05,
+        spec.pose,
+        spec.foot_contacts.join(", ")
+    );
+    write_text_if_changed(path, &svg)
+}
+
+fn analyze_animation_frame(path: &Path) -> Result<AnimationJobFrameAnalysis> {
+    let source = decode_image(path)?;
+    let cleaned = remove_generation_chroma_key(&source);
+    let bbox = alpha_bbox(&cleaned);
+    let visible_pixels = cleaned.pixels().filter(|pixel| pixel[3] > 24).count() as u64;
+    let green_edge_pixels = count_green_edge_pixels(&cleaned);
+    let style = bbox.and_then(|bbox| foreground_style_stats(&cleaned, bbox, visible_pixels));
+    let gait = bbox.and_then(|bbox| foreground_gait_stats(&cleaned, bbox, visible_pixels));
+    let bbox_center = bbox.map(|bbox| Pivot {
+        x: (bbox.x as f32 + bbox.w as f32 / 2.0) / cleaned.width().max(1) as f32,
+        y: (bbox.y as f32 + bbox.h as f32 / 2.0) / cleaned.height().max(1) as f32,
+    });
+    let bbox_size = bbox.map(|bbox| Size {
+        w: bbox.w,
+        h: bbox.h,
+    });
+    Ok(AnimationJobFrameAnalysis {
+        source_size: Size {
+            w: source.width(),
+            h: source.height(),
+        },
+        bbox: bbox.map(json_rect),
+        bbox_center,
+        bbox_size,
+        visible_pixels,
+        green_edge_pixels,
+        style,
+        gait,
+    })
+}
+
+fn foreground_style_stats(
+    image: &RgbaImage,
+    bbox: Rect,
+    visible_pixels: u64,
+) -> Option<AnimationJobStyleStats> {
+    if visible_pixels == 0 {
+        return None;
+    }
+    let mut total = 0.0_f32;
+    let mut r_sum = 0.0_f32;
+    let mut g_sum = 0.0_f32;
+    let mut b_sum = 0.0_f32;
+    let mut saturation_sum = 0.0_f32;
+    let mut orange = 0.0_f32;
+    let mut cream = 0.0_f32;
+    let mut dark = 0.0_f32;
+    let x_end = bbox.x.saturating_add(bbox.w).min(image.width());
+    let y_end = bbox.y.saturating_add(bbox.h).min(image.height());
+    for y in bbox.y..y_end {
+        for x in bbox.x..x_end {
+            let pixel = image.get_pixel(x, y);
+            let [r, g, b, a] = pixel.0;
+            if a <= 24 {
+                continue;
+            }
+            let r_f = r as f32;
+            let g_f = g as f32;
+            let b_f = b as f32;
+            let max_channel = r.max(g).max(b);
+            let min_channel = r.min(g).min(b);
+            r_sum += r_f;
+            g_sum += g_f;
+            b_sum += b_f;
+            if max_channel > 0 {
+                saturation_sum +=
+                    (max_channel.saturating_sub(min_channel) as f32) / max_channel as f32;
+            }
+            if r_f > g_f * 1.08 && g_f > b_f * 1.08 && r > 110 {
+                orange += 1.0;
+            }
+            if r > 180 && g > 145 && b > 100 && r.abs_diff(g) < 80 {
+                cream += 1.0;
+            }
+            if max_channel < 85 {
+                dark += 1.0;
+            }
+            total += 1.0;
+        }
+    }
+    if total <= 0.0 {
+        return None;
+    }
+    let bbox_area = (bbox.w as f32 * bbox.h as f32).max(1.0);
+    Some(AnimationJobStyleStats {
+        mean_r: r_sum / total,
+        mean_g: g_sum / total,
+        mean_b: b_sum / total,
+        mean_saturation: saturation_sum / total,
+        orange_ratio: orange / total,
+        cream_ratio: cream / total,
+        dark_ratio: dark / total,
+        silhouette_density: total / bbox_area,
+    })
+}
+
+fn foreground_gait_stats(
+    image: &RgbaImage,
+    bbox: Rect,
+    visible_pixels: u64,
+) -> Option<AnimationJobGaitStats> {
+    if visible_pixels == 0 || bbox.w == 0 || bbox.h == 0 {
+        return None;
+    }
+    let (root_x, root_y) = upper_body_anchor(image, bbox);
+    let width = image.width().max(1) as f32;
+    let height = image.height().max(1) as f32;
+    let ground_y = bbox.y.saturating_add(bbox.h) as f32 / height;
+
+    let contact_start_y = bbox.y + ((bbox.h as f32 * 0.86).round() as u32).min(bbox.h);
+    let contact_end_y = bbox.y.saturating_add(bbox.h).min(image.height());
+    if contact_start_y >= contact_end_y {
+        return Some(AnimationJobGaitStats {
+            root_anchor: Pivot {
+                x: root_x / width,
+                y: root_y / height,
+            },
+            ground_y,
+            contact_count: 0,
+            stance_width: 0.0,
+            contact_center_x: 0.5,
+            rear_contact_ratio: 0.0,
+            front_contact_ratio: 0.0,
+            lower_body_ratio: 0.0,
+            contact_points: Vec::new(),
+        });
+    }
+
+    let mut counts = vec![0_u32; bbox.w as usize];
+    let mut lower_pixels = 0.0_f32;
+    let mut rear_pixels = 0.0_f32;
+    let mut front_pixels = 0.0_f32;
+    let mut weighted_x = 0.0_f32;
+    let mid_x = bbox.x as f32 + bbox.w as f32 * 0.5;
+    let x_end = bbox.x.saturating_add(bbox.w).min(image.width());
+    for y in contact_start_y..contact_end_y {
+        for x in bbox.x..x_end {
+            if image.get_pixel(x, y)[3] <= 24 {
+                continue;
+            }
+            let local_x = x.saturating_sub(bbox.x) as usize;
+            if let Some(count) = counts.get_mut(local_x) {
+                *count += 1;
+            }
+            lower_pixels += 1.0;
+            weighted_x += (x as f32 - bbox.x as f32) / bbox.w as f32;
+            if x as f32 <= mid_x {
+                rear_pixels += 1.0;
+            } else {
+                front_pixels += 1.0;
+            }
+        }
+    }
+
+    let band_h = contact_end_y.saturating_sub(contact_start_y).max(1);
+    let runs = projection_runs(
+        &counts,
+        (band_h / 22).max(1),
+        (bbox.w / 70).max(2),
+        (bbox.w / 80).max(3),
+    );
+    let mut contact_points = Vec::new();
+    for (start, end) in runs {
+        let mut px = 0.0_f32;
+        let mut py = 0.0_f32;
+        let mut total = 0.0_f32;
+        let run_x0 = bbox.x.saturating_add(start);
+        let run_x1 = bbox.x.saturating_add(end).min(x_end);
+        for y in contact_start_y..contact_end_y {
+            for x in run_x0..run_x1 {
+                let alpha = image.get_pixel(x, y)[3] as f32;
+                if alpha <= 24.0 {
+                    continue;
+                }
+                px += ((x as f32 - bbox.x as f32) / bbox.w as f32) * alpha;
+                py += ((y as f32 - bbox.y as f32) / bbox.h as f32) * alpha;
+                total += alpha;
+            }
+        }
+        if total > 0.0 {
+            contact_points.push(Pivot {
+                x: px / total,
+                y: py / total,
+            });
+        }
+    }
+    contact_points.sort_by(|left, right| {
+        left.x
+            .partial_cmp(&right.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let stance_width = match (contact_points.first(), contact_points.last()) {
+        (Some(first), Some(last)) if contact_points.len() >= 2 => (last.x - first.x).max(0.0),
+        _ => 0.0,
+    };
+    let lower_body_ratio = lower_pixels / visible_pixels.max(1) as f32;
+    let contact_center_x = if lower_pixels > 0.0 {
+        weighted_x / lower_pixels
+    } else {
+        0.5
+    };
+    Some(AnimationJobGaitStats {
+        root_anchor: Pivot {
+            x: root_x / width,
+            y: root_y / height,
+        },
+        ground_y,
+        contact_count: contact_points.len(),
+        stance_width,
+        contact_center_x,
+        rear_contact_ratio: rear_pixels / lower_pixels.max(1.0),
+        front_contact_ratio: front_pixels / lower_pixels.max(1.0),
+        lower_body_ratio,
+        contact_points,
+    })
+}
+
+fn accepted_frame_analyses(
+    job: &AnimationJob,
+    skip_index: Option<usize>,
+) -> Result<Vec<AnimationJobFrameAnalysis>> {
+    let frames_dir = PathBuf::from(&job.frames_dir);
+    let mut analyses = Vec::new();
+    for frame in &job.frames {
+        if Some(frame.index) == skip_index {
+            continue;
+        }
+        let path = frames_dir.join(&frame.filename);
+        if path.exists() {
+            analyses.push(analyze_animation_frame(&path)?);
+        }
+    }
+    Ok(analyses)
+}
+
+fn validate_animation_frame(
+    job: &AnimationJob,
+    frame_plan: &AnimationFramePlan,
+    analysis: &AnimationJobFrameAnalysis,
+    accepted: &[AnimationJobFrameAnalysis],
+) -> (Vec<String>, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    if analysis.bbox.is_none() || analysis.visible_pixels == 0 {
+        errors.push("No visible sprite pixels after matte cleanup".to_string());
+        return (errors, warnings);
+    }
+    if analysis.source_size.w < 64 || analysis.source_size.h < 64 {
+        warnings
+            .push("Frame is very small; image generation should use a larger canvas".to_string());
+    }
+    if analysis.green_edge_pixels > 64 {
+        warnings.push(format!(
+            "{} green-dominant edge pixels remain after cleanup; prefer transparent or dark-gray matte",
+            analysis.green_edge_pixels
+        ));
+    }
+    if let Some(bbox) = analysis.bbox {
+        if bbox.x <= 1
+            || bbox.y <= 1
+            || bbox.x + bbox.w + 1 >= analysis.source_size.w
+            || bbox.y + bbox.h + 1 >= analysis.source_size.h
+        {
+            warnings.push(
+                "Visible sprite touches the canvas edge; regenerate with more transparent padding"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(size) = analysis.bbox_size {
+        let frame_area = (analysis.source_size.w as u64 * analysis.source_size.h as u64).max(1);
+        let bbox_area = size.w as u64 * size.h as u64;
+        if bbox_area * 100 < frame_area * 8 {
+            warnings.push("Sprite is tiny inside the frame; preserve full-body scale".to_string());
+        }
+        if bbox_area * 100 > frame_area * 92 {
+            warnings.push(
+                "Sprite nearly fills the frame; leave room for paws and tail motion".to_string(),
+            );
+        }
+    }
+    if let Some((median_w, median_h, median_pixels, median_center)) =
+        median_accepted_frame_stats(accepted)
+    {
+        if let Some(size) = analysis.bbox_size {
+            if relative_delta(size.w as f32, median_w) > 0.35 {
+                errors.push(format!(
+                    "Body width changed too much for {}: expected near {:.1}px, got {}px",
+                    frame_plan.pose, median_w, size.w
+                ));
+            }
+            if relative_delta(size.h as f32, median_h) > 0.28 {
+                errors.push(format!(
+                    "Body height changed too much for {}: expected near {:.1}px, got {}px",
+                    frame_plan.pose, median_h, size.h
+                ));
+            }
+        }
+        if median_pixels > 0.0 {
+            let pixel_delta = relative_delta(analysis.visible_pixels as f32, median_pixels);
+            if pixel_delta > 0.55 {
+                errors.push(format!(
+                    "Visible sprite area changed too much for {}",
+                    frame_plan.pose
+                ));
+            }
+        }
+        if let (Some(center), Some(median_center)) = (analysis.bbox_center, median_center) {
+            if (center.x - median_center.x).abs() > 0.22
+                || (center.y - median_center.y).abs() > 0.22
+            {
+                errors.push(format!(
+                    "Sprite center drifted too far for {}; keep root/camera locked",
+                    frame_plan.pose
+                ));
+            }
+        }
+    }
+    if let (Some(style), Some(median_style)) =
+        (analysis.style, median_accepted_style_stats(accepted))
+    {
+        if relative_delta(style.mean_saturation, median_style.mean_saturation) > 0.14 {
+            errors.push(format!(
+                "Foreground saturation drifted too far for {}; regenerate with the same palette and rendering style",
+                frame_plan.pose
+            ));
+        }
+        if relative_delta(style.orange_ratio, median_style.orange_ratio) > 0.16 {
+            errors.push(format!(
+                "Orange body-color coverage changed too much for {}; keep the same cat identity and markings",
+                frame_plan.pose
+            ));
+        }
+        if relative_delta(style.mean_b, median_style.mean_b) > 0.22 {
+            errors.push(format!(
+                "Foreground color balance shifted too far for {}; keep the same orange-and-cream palette",
+                frame_plan.pose
+            ));
+        }
+        if relative_delta(style.silhouette_density, median_style.silhouette_density) > 0.16 {
+            warnings.push(format!(
+                "Silhouette density changed for {}; check for missing body detail or extra matte pixels",
+                frame_plan.pose
+            ));
+        }
+    }
+    if job.action == "cat_walk" {
+        if frame_plan.foot_contacts.is_empty() {
+            warnings.push("Cat walk frame has no planned paw contact metadata".to_string());
+        }
+        match &analysis.gait {
+            Some(gait) => {
+                if gait.contact_count < 2 {
+                    errors.push(format!(
+                        "{} does not show at least two readable paw-contact clusters; regenerate with planted front and hind paws",
+                        frame_plan.pose
+                    ));
+                }
+                if gait.stance_width < 0.22 {
+                    errors.push(format!(
+                        "{} paw contacts are too bunched to read as a walk stance; use the pose guide's front/hind spacing",
+                        frame_plan.pose
+                    ));
+                }
+                if gait.rear_contact_ratio < 0.12 || gait.front_contact_ratio < 0.12 {
+                    errors.push(format!(
+                        "{} lacks balanced rear/front lower-body support; keep one hind-side and one front-side paw contact",
+                        frame_plan.pose
+                    ));
+                }
+                if gait.lower_body_ratio < 0.035 {
+                    warnings.push(format!(
+                        "{} has little lower-body foreground detail; paws may be too hidden for validation",
+                        frame_plan.pose
+                    ));
+                }
+                if let Some((median_root, median_ground_y)) = median_accepted_gait_stats(accepted) {
+                    if (gait.root_anchor.x - median_root.x).abs() > 0.075 {
+                        errors.push(format!(
+                            "{} root anchor shifted horizontally; keep the torso/head locked while only paws move",
+                            frame_plan.pose
+                        ));
+                    }
+                    if (gait.ground_y - median_ground_y).abs() > 0.07 {
+                        errors.push(format!(
+                            "{} ground anchor moved too far; keep paws on the same invisible ground line",
+                            frame_plan.pose
+                        ));
+                    }
+                }
+            }
+            None => errors.push(format!(
+                "{} has no measurable lower-body gait; regenerate with visible paws and legs",
+                frame_plan.pose
+            )),
+        }
+    }
+    (errors, warnings)
+}
+
+fn median_accepted_frame_stats(
+    analyses: &[AnimationJobFrameAnalysis],
+) -> Option<(f32, f32, f32, Option<Pivot>)> {
+    let widths = analyses
+        .iter()
+        .filter_map(|analysis| analysis.bbox_size.map(|size| size.w as f32))
+        .collect::<Vec<_>>();
+    let heights = analyses
+        .iter()
+        .filter_map(|analysis| analysis.bbox_size.map(|size| size.h as f32))
+        .collect::<Vec<_>>();
+    let pixels = analyses
+        .iter()
+        .map(|analysis| analysis.visible_pixels as f32)
+        .filter(|value| *value > 0.0)
+        .collect::<Vec<_>>();
+    let centers_x = analyses
+        .iter()
+        .filter_map(|analysis| analysis.bbox_center.map(|center| center.x))
+        .collect::<Vec<_>>();
+    let centers_y = analyses
+        .iter()
+        .filter_map(|analysis| analysis.bbox_center.map(|center| center.y))
+        .collect::<Vec<_>>();
+    let median_w = median_f32(&widths)?;
+    let median_h = median_f32(&heights)?;
+    let median_pixels = median_f32(&pixels)?;
+    let median_center = match (median_f32(&centers_x), median_f32(&centers_y)) {
+        (Some(x), Some(y)) => Some(Pivot { x, y }),
+        _ => None,
+    };
+    Some((median_w, median_h, median_pixels, median_center))
+}
+
+fn median_accepted_style_stats(
+    analyses: &[AnimationJobFrameAnalysis],
+) -> Option<AnimationJobStyleStats> {
+    if analyses.len() < 3 {
+        return None;
+    }
+    let styles = analyses
+        .iter()
+        .filter_map(|analysis| analysis.style)
+        .collect::<Vec<_>>();
+    if styles.len() < 3 {
+        return None;
+    }
+    Some(AnimationJobStyleStats {
+        mean_r: median_f32(&styles.iter().map(|style| style.mean_r).collect::<Vec<_>>())?,
+        mean_g: median_f32(&styles.iter().map(|style| style.mean_g).collect::<Vec<_>>())?,
+        mean_b: median_f32(&styles.iter().map(|style| style.mean_b).collect::<Vec<_>>())?,
+        mean_saturation: median_f32(
+            &styles
+                .iter()
+                .map(|style| style.mean_saturation)
+                .collect::<Vec<_>>(),
+        )?,
+        orange_ratio: median_f32(
+            &styles
+                .iter()
+                .map(|style| style.orange_ratio)
+                .collect::<Vec<_>>(),
+        )?,
+        cream_ratio: median_f32(
+            &styles
+                .iter()
+                .map(|style| style.cream_ratio)
+                .collect::<Vec<_>>(),
+        )?,
+        dark_ratio: median_f32(
+            &styles
+                .iter()
+                .map(|style| style.dark_ratio)
+                .collect::<Vec<_>>(),
+        )?,
+        silhouette_density: median_f32(
+            &styles
+                .iter()
+                .map(|style| style.silhouette_density)
+                .collect::<Vec<_>>(),
+        )?,
+    })
+}
+
+fn median_accepted_gait_stats(analyses: &[AnimationJobFrameAnalysis]) -> Option<(Pivot, f32)> {
+    if analyses.len() < 3 {
+        return None;
+    }
+    let gaits = analyses
+        .iter()
+        .filter_map(|analysis| analysis.gait.as_ref())
+        .collect::<Vec<_>>();
+    if gaits.len() < 3 {
+        return None;
+    }
+    let root_x = median_f32(
+        &gaits
+            .iter()
+            .map(|gait| gait.root_anchor.x)
+            .collect::<Vec<_>>(),
+    )?;
+    let root_y = median_f32(
+        &gaits
+            .iter()
+            .map(|gait| gait.root_anchor.y)
+            .collect::<Vec<_>>(),
+    )?;
+    let ground_y = median_f32(&gaits.iter().map(|gait| gait.ground_y).collect::<Vec<_>>())?;
+    Some((
+        Pivot {
+            x: root_x,
+            y: root_y,
+        },
+        ground_y,
+    ))
+}
+
+fn relative_delta(value: f32, target: f32) -> f32 {
+    if target.abs() <= f32::EPSILON {
+        0.0
+    } else {
+        (value - target).abs() / target.abs()
+    }
+}
+
+fn count_green_edge_pixels(image: &RgbaImage) -> u64 {
+    let mut count = 0;
+    for y in 0..image.height() {
+        for x in 0..image.width() {
+            let pixel = image.get_pixel(x, y);
+            if pixel[3] > 24
+                && pixel[1] > pixel[0].max(pixel[2]).saturating_add(18)
+                && touches_transparent_neighbor(image, x, y)
+            {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+fn slugify(value: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_underscore = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            previous_underscore = false;
+        } else if !previous_underscore {
+            slug.push('_');
+            previous_underscore = true;
+        }
+    }
+    slug.trim_matches('_').to_string()
+}
+
+fn json_rect(rect: Rect) -> JsonRect {
+    JsonRect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+    }
+}
+
+fn remove_generation_chroma_key(image: &RgbaImage) -> RgbaImage {
+    let mut output = image.clone();
+    for pixel in output.pixels_mut() {
+        let [r, g, b, a] = pixel.0;
+        let r_i = r as i16;
+        let g_i = g as i16;
+        let b_i = b as i16;
+        let green_score = g_i - r_i.max(b_i);
+        let magenta_score = r_i.min(b_i) - g_i;
+        if g > 130 && green_score > 35 {
+            if green_score > 82 {
+                *pixel = Rgba([r, g, b, 0]);
+            } else {
+                let alpha_cut = (((green_score - 35) as f32 / 47.0) * 255.0).round() as u8;
+                *pixel = Rgba([r, g.min(r.max(b).saturating_add(8)), b, 255 - alpha_cut]);
+            }
+        } else if r > 120 && b > 120 && g < 170 && magenta_score > 18 {
+            if magenta_score > 34 {
+                *pixel = Rgba([r, g, b, 0]);
+            } else {
+                let alpha_cut = (((magenta_score - 18) as f32 / 16.0) * 255.0).round() as u8;
+                let clean = g.saturating_add(4).max(r.min(b));
+                *pixel = Rgba([clean, g, clean, 255 - alpha_cut]);
+            }
+        } else if a > 0 && r > 55 && b > 55 && g < 115 && magenta_score > 12 && r.abs_diff(b) <= 96
+        {
+            if r.max(b) > 150 && magenta_score > 28 {
+                *pixel = Rgba([r, g, b, 0]);
+            } else {
+                let clean = g.saturating_add(10).min(r.min(b).saturating_sub(36));
+                *pixel = Rgba([clean, g, clean, a]);
+            }
+        } else if g > 135 && b > 135 && r < 130 && g.min(b) as i16 - r_i > 38 {
+            let cyan_score = g_i.min(b_i) - r_i;
+            if cyan_score > 72 {
+                *pixel = Rgba([r, g, b, 0]);
+            } else {
+                let alpha_cut = (((cyan_score - 38) as f32 / 34.0) * 255.0).round() as u8;
+                let clean = r.saturating_add(8).min(g.min(b).saturating_sub(24));
+                *pixel = Rgba([r, clean, clean, 255 - alpha_cut]);
+            }
+        }
+    }
+    remove_border_connected_generated_matte(&mut output);
+    decontaminate_transparent_edges(&mut output);
+    output
+}
+
+fn remove_border_connected_generated_matte(image: &mut RgbaImage) {
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return;
+    }
+    let mut visited = vec![false; width as usize * height as usize];
+    let mut stack = Vec::new();
+    for x in 0..width {
+        stack.push((x, 0));
+        stack.push((x, height - 1));
+    }
+    for y in 0..height {
+        stack.push((0, y));
+        stack.push((width - 1, y));
+    }
+
+    while let Some((x, y)) = stack.pop() {
+        let index = pixel_index(width, x, y);
+        if visited[index] {
+            continue;
+        }
+        visited[index] = true;
+        if !is_generated_matte_or_transparent(image.get_pixel(x, y)) {
+            continue;
+        }
+        if image.get_pixel(x, y)[3] > 0 {
+            let mut pixel = *image.get_pixel(x, y);
+            pixel[3] = 0;
+            image.put_pixel(x, y, pixel);
+        }
+        if x > 0 {
+            stack.push((x - 1, y));
+        }
+        if y > 0 {
+            stack.push((x, y - 1));
+        }
+        if x + 1 < width {
+            stack.push((x + 1, y));
+        }
+        if y + 1 < height {
+            stack.push((x, y + 1));
+        }
+    }
+}
+
+fn decontaminate_transparent_edges(image: &mut RgbaImage) {
+    let width = image.width();
+    let height = image.height();
+    if width == 0 || height == 0 {
+        return;
+    }
+    let source = image.clone();
+    for y in 0..height {
+        for x in 0..width {
+            let mut pixel = *source.get_pixel(x, y);
+            if pixel[3] <= 24 || !touches_transparent_neighbor(&source, x, y) {
+                continue;
+            }
+            let [r, g, b, a] = pixel.0;
+            let r_i = r as i16;
+            let g_i = g as i16;
+            let b_i = b as i16;
+            let green_score = g_i - r_i.max(b_i);
+            if g > 90 && green_score > 8 {
+                let spill = green_score.min(80) as u8;
+                pixel[1] = r.max(b).saturating_add(4).min(g);
+                pixel[3] = a.saturating_sub(spill.saturating_mul(2));
+            } else if is_dark_gray_generated_matte(pixel) && a < 224 {
+                pixel[3] = 0;
+            }
+            image.put_pixel(x, y, pixel);
+        }
+    }
+}
+
+fn touches_transparent_neighbor(image: &RgbaImage, x: u32, y: u32) -> bool {
+    let width = image.width();
+    let height = image.height();
+    (x > 0 && image.get_pixel(x - 1, y)[3] <= 24)
+        || (y > 0 && image.get_pixel(x, y - 1)[3] <= 24)
+        || (x + 1 < width && image.get_pixel(x + 1, y)[3] <= 24)
+        || (y + 1 < height && image.get_pixel(x, y + 1)[3] <= 24)
+}
+
+fn is_generated_matte_or_transparent(pixel: &Rgba<u8>) -> bool {
+    pixel[3] <= 24 || is_generated_matte_pixel(*pixel)
+}
+
+fn is_generated_matte_pixel(pixel: Rgba<u8>) -> bool {
+    let [r, g, b, a] = pixel.0;
+    if a <= 24 {
+        return true;
+    }
+    let r_i = r as i16;
+    let g_i = g as i16;
+    let b_i = b as i16;
+    let green_score = g_i - r_i.max(b_i);
+    let magenta_score = r_i.min(b_i) - g_i;
+    let cyan_score = g_i.min(b_i) - r_i;
+    (g > 110 && green_score > 18)
+        || (r > 100 && b > 100 && g < 175 && magenta_score > 14)
+        || (g > 115 && b > 115 && r < 145 && cyan_score > 24)
+        || is_dark_gray_generated_matte(pixel)
+}
+
+fn is_dark_gray_generated_matte(pixel: Rgba<u8>) -> bool {
+    let [r, g, b, a] = pixel.0;
+    if a <= 24 {
+        return true;
+    }
+    let max_channel = r.max(g).max(b);
+    let min_channel = r.min(g).min(b);
+    max_channel <= 105 && max_channel >= 12 && max_channel - min_channel <= 24
+}
+
+fn generated_loop_continuity_report(
+    sheet: &RgbaImage,
+    frame_rects: &[Rect],
+) -> Option<SliceContinuityReport> {
+    if frame_rects.len() < 2 {
+        return None;
+    }
+    let mut deltas = Vec::new();
+    for pair in frame_rects.windows(2) {
+        deltas.push(frame_delta(sheet, pair[0], pair[1]));
+    }
+    let loop_delta = frame_delta(sheet, *frame_rects.last()?, frame_rects[0]);
+    let median_neighbor_delta = median_f32(&deltas).unwrap_or(0.0);
+    let max_neighbor_delta = deltas.iter().copied().fold(0.0, f32::max);
+    let mut warnings = Vec::new();
+    if !matches!(frame_rects.len(), 8 | 12 | 16) {
+        warnings
+            .push("Generated walk loops usually export one 8, 12, or 16 frame cycle".to_string());
+    }
+    if loop_delta < 0.008 {
+        warnings.push(
+            "Last frame appears to duplicate the first frame; export should end on the in-between before frame 1".to_string(),
+        );
+    } else if median_neighbor_delta > 0.0 && loop_delta > (median_neighbor_delta * 1.25).max(0.14) {
+        warnings.push(
+            "Last-to-first frame jump is larger than neighboring motion; regenerate with a loopable tail frame".to_string(),
+        );
+    }
+    if median_neighbor_delta > 0.0 && max_neighbor_delta > (median_neighbor_delta * 2.4).max(0.18) {
+        warnings.push(
+            "One or more adjacent frame jumps are much larger than the median; this looks like random poses instead of a gait cycle".to_string(),
+        );
+    }
+    Some(SliceContinuityReport {
+        frame_count: frame_rects.len(),
+        protocol:
+            "single_walk_cycle_contact_down_passing_up_opposite_contact_opposite_down_opposite_passing_opposite_up_no_duplicate_tail"
+                .to_string(),
+        median_neighbor_delta,
+        loop_delta,
+        max_neighbor_delta,
+        warnings,
+    })
+}
+
+fn frame_delta(sheet: &RgbaImage, left: Rect, right: Rect) -> f32 {
+    let width = left.w.min(right.w);
+    let height = left.h.min(right.h);
+    if width == 0 || height == 0 {
+        return 0.0;
+    }
+    let step = (width.max(height) / 64).max(1);
+    let mut total = 0.0;
+    let mut count = 0.0;
+    let mut y = 0;
+    while y < height {
+        let mut x = 0;
+        while x < width {
+            let a = sheet.get_pixel(left.x + x, left.y + y).0;
+            let b = sheet.get_pixel(right.x + x, right.y + y).0;
+            let alpha_weight = (a[3].max(b[3]) as f32 / 255.0).max(0.1);
+            let dr = (a[0] as f32 - b[0] as f32).abs();
+            let dg = (a[1] as f32 - b[1] as f32).abs();
+            let db = (a[2] as f32 - b[2] as f32).abs();
+            let da = (a[3] as f32 - b[3] as f32).abs();
+            total += ((dr + dg + db + da) / (4.0 * 255.0)) * alpha_weight;
+            count += alpha_weight;
+            x += step;
+        }
+        y += step;
+    }
+    if count > 0.0 {
+        total / count
+    } else {
+        0.0
+    }
 }
 
 fn load_sources(input: &Path, trim: bool) -> Result<Vec<SourceSprite>> {
@@ -4596,6 +7251,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -4672,6 +7329,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
         std::env::remove_var(ASEPRITE_BIN_ENV);
@@ -4749,6 +7408,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: vec!["_n".to_string()],
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -4991,6 +7652,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         };
         let options_b = PackOptions {
             output: out_b.clone(),
@@ -5040,6 +7703,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         };
         pack(options.clone()).unwrap();
         let sheet_mtime = fs::metadata(output.join("sheet.png"))
@@ -5135,6 +7800,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -5185,6 +7852,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -5241,6 +7910,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -5293,6 +7964,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -5345,6 +8018,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -5390,6 +8065,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -5505,6 +8182,8 @@ mod tests {
             stable_pivot: true,
             dedup_threshold: Some(3),
             linked_channels: vec!["_n".to_string()],
+            normalize_generated: false,
+            frame_size: None,
         };
 
         write_project_file(&project_path, &options).unwrap();
@@ -5590,6 +8269,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: vec!["_n".to_string()],
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -5799,6 +8480,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -5845,6 +8528,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         };
         options.animations.push(AnimationDefinition {
             name: "idle_custom".to_string(),
@@ -5908,6 +8593,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         };
         options.animations.push(AnimationDefinition {
             name: "idle_custom".to_string(),
@@ -5993,6 +8680,8 @@ mod tests {
             stable_pivot: true,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -6064,6 +8753,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: Some(0),
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -6149,6 +8840,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: Some(0),
             linked_channels: vec!["_n".to_string()],
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -6231,6 +8924,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -6277,6 +8972,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -6335,6 +9032,8 @@ mod tests {
             stable_pivot: false,
             dedup_threshold: None,
             linked_channels: Vec::new(),
+            normalize_generated: false,
+            frame_size: None,
         })
         .unwrap();
 
@@ -6343,6 +9042,348 @@ mod tests {
         assert!(output.join("atlas.json").exists());
         assert!(output.join("frames/tile_0000.png").exists());
         assert!(output.join("frames/tile_0001.png").exists());
+    }
+
+    #[test]
+    fn generated_grid_slice_normalizes_frames_and_writes_manifest() {
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("generated.png");
+        let output = temp.path().join("normalized");
+        let mut sheet = RgbaImage::from_pixel(64, 64, Rgba([0, 255, 0, 255]));
+        for row in 0..2 {
+            for column in 0..2 {
+                let origin_x = column * 32;
+                let origin_y = row * 32;
+                let offset = row + column;
+                for y in origin_y + 5 + offset..origin_y + 27 + offset {
+                    for x in origin_x + 9 - offset..origin_x + 23 - offset {
+                        sheet.put_pixel(x, y, Rgba([220, 40, 64, 255]));
+                    }
+                }
+            }
+        }
+        sheet.save(&input).unwrap();
+
+        let report = slice_sheet(PackOptions {
+            input,
+            output: output.clone(),
+            format: OutputFormat::Png,
+            packing_strategy: PackingStrategy::MaxRects,
+            pot: true,
+            padding: 2,
+            max_size: DEFAULT_MAX_SIZE,
+            rotate: false,
+            trim: true,
+            dry_run: false,
+            watch: false,
+            slice_mode: Some(SliceMode::Grid),
+            cell: Some((32, 32)),
+            prefix: "walk".to_string(),
+            aseprite_json: false,
+            godot_spriteframes: false,
+            unity_importer: false,
+            animation_regex: None,
+            animations: Vec::new(),
+            stable_pivot: false,
+            dedup_threshold: None,
+            linked_channels: Vec::new(),
+            normalize_generated: true,
+            frame_size: Some((32, 32)),
+        })
+        .unwrap();
+
+        let normalization = report.normalization.as_ref().unwrap();
+        assert_eq!(report.frame_count, 4);
+        assert_eq!((report.sheet_width, report.sheet_height), (64, 64));
+        assert_eq!(normalization.output_frame_size, Size { w: 32, h: 32 });
+        assert_eq!(normalization.source_cells.len(), 4);
+        assert_eq!(normalization.frame_bboxes.len(), 4);
+        assert!(normalization.scale.is_finite());
+        assert!(output.join("spritesheet_normalization.json").exists());
+        assert!(output.join("frames/walk_0000.png").exists());
+        let normalized_sheet = decode_image(&output.join("sheet.png")).unwrap();
+        assert_eq!(normalized_sheet.get_pixel(0, 0)[3], 0);
+        assert_eq!(report.atlas.frames[0].frame.w, 32);
+        assert!((report.atlas.frames[0].pivot.y - 0.305).abs() < 0.001);
+    }
+
+    #[test]
+    fn generated_grid_rounds_approximate_explicit_cell_to_source_count() {
+        let mut sheet = RgbaImage::from_pixel(1254, 1254, Rgba([0, 0, 0, 0]));
+        let x_bounds = proportional_bounds(sheet.width(), 4);
+        let y_bounds = proportional_bounds(sheet.height(), 4);
+        for row in 0..4 {
+            for column in 0..4 {
+                let x0 = x_bounds[column as usize];
+                let x1 = x_bounds[column as usize + 1];
+                let y0 = y_bounds[row as usize];
+                let y1 = y_bounds[row as usize + 1];
+                let inset_x = (x1 - x0) / 4;
+                let inset_y = (y1 - y0) / 4;
+                for y in y0 + inset_y..y1 - inset_y {
+                    for x in x0 + inset_x..x1 - inset_x {
+                        sheet.put_pixel(x, y, Rgba([240, 120, 32, 255]));
+                    }
+                }
+            }
+        }
+
+        let detection = detect_generated_grid_rects(&sheet, Some((314, 314))).unwrap();
+
+        assert_eq!(detection.columns, Some(4));
+        assert_eq!(detection.rows, Some(4));
+        assert_eq!(detection.rects.len(), 16);
+        assert!(detection
+            .grid_detection
+            .contains("explicit_cell_approx_grid"));
+    }
+
+    #[test]
+    fn generated_grid_infers_common_square_sheet_without_cell_size() {
+        let sheet = RgbaImage::from_pixel(1254, 1254, Rgba([240, 120, 32, 255]));
+
+        let detection = detect_generated_grid_rects(&sheet, None).unwrap();
+
+        assert_eq!(detection.columns, Some(4));
+        assert_eq!(detection.rows, Some(4));
+        assert_eq!(detection.rects.len(), 16);
+        assert!(detection.grid_detection.contains("inferred_generated_4x4"));
+    }
+
+    #[test]
+    fn generated_cleanup_removes_border_connected_dark_gray_matte() {
+        let mut image = RgbaImage::from_pixel(12, 12, Rgba([38, 40, 42, 255]));
+        for y in 4..8 {
+            for x in 4..8 {
+                image.put_pixel(x, y, Rgba([240, 120, 32, 255]));
+            }
+        }
+
+        let cleaned = remove_generation_chroma_key(&image);
+
+        assert_eq!(cleaned.get_pixel(0, 0)[3], 0);
+        assert_eq!(cleaned.get_pixel(3, 6)[3], 0);
+        assert_eq!(cleaned.get_pixel(5, 5)[3], 255);
+    }
+
+    #[test]
+    fn generated_cleanup_neutralizes_green_edge_spill() {
+        let mut image = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 0]));
+        for y in 2..6 {
+            for x in 2..6 {
+                image.put_pixel(x, y, Rgba([240, 120, 32, 255]));
+            }
+        }
+        image.put_pixel(1, 3, Rgba([72, 142, 58, 220]));
+        image.put_pixel(1, 4, Rgba([72, 142, 58, 220]));
+
+        let cleaned = remove_generation_chroma_key(&image);
+        let edge = cleaned.get_pixel(1, 3);
+
+        assert!(edge[3] <= 24 || edge[1] <= edge[0].max(edge[2]).saturating_add(8));
+        assert_eq!(cleaned.get_pixel(3, 3)[3], 255);
+    }
+
+    #[test]
+    fn generated_normalization_reports_loop_continuity_protocol() {
+        let sheet = RgbaImage::from_pixel(64, 64, Rgba([240, 120, 32, 255]));
+        let detection = detect_generated_grid_rects(&sheet, Some((32, 32))).unwrap();
+        let temp = TempDir::new().unwrap();
+
+        let normalized = normalize_generated_slice(
+            &sheet,
+            &detection,
+            &PackOptions {
+                input: temp.path().join("generated.png"),
+                output: temp.path().join("out"),
+                format: OutputFormat::Png,
+                packing_strategy: PackingStrategy::MaxRects,
+                pot: true,
+                padding: 0,
+                max_size: DEFAULT_MAX_SIZE,
+                rotate: false,
+                trim: false,
+                dry_run: false,
+                watch: false,
+                slice_mode: Some(SliceMode::Grid),
+                cell: Some((32, 32)),
+                prefix: "walk".to_string(),
+                aseprite_json: false,
+                godot_spriteframes: false,
+                unity_importer: false,
+                animation_regex: None,
+                animations: Vec::new(),
+                stable_pivot: false,
+                dedup_threshold: None,
+                linked_channels: Vec::new(),
+                normalize_generated: true,
+                frame_size: Some((32, 32)),
+            },
+        )
+        .unwrap();
+
+        let continuity = normalized.report.continuity.as_ref().unwrap();
+        assert_eq!(continuity.frame_count, 4);
+        assert!(continuity.protocol.contains("single_walk_cycle"));
+    }
+
+    #[test]
+    fn assemble_generated_loop_normalizes_separate_frame_files() {
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("frames_in");
+        let output = temp.path().join("assembled");
+        fs::create_dir_all(&input).unwrap();
+        for index in 0..8 {
+            let mut frame = RgbaImage::from_pixel(64, 64, Rgba([38, 40, 42, 255]));
+            let x_offset = (index % 4) as u32;
+            for y in 18..50 {
+                for x in 22 + x_offset..42 + x_offset {
+                    frame.put_pixel(x, y, Rgba([240, 120, 32, 255]));
+                }
+            }
+            frame
+                .save(input.join(format!("{index:03}_walk_pose.png")))
+                .unwrap();
+        }
+
+        let report = assemble_generated_loop(GeneratedLoopOptions {
+            input,
+            output: output.clone(),
+            format: OutputFormat::Png,
+            dry_run: false,
+            columns: None,
+            prefix: "walk".to_string(),
+            aseprite_json: true,
+            frame_size: Some((32, 32)),
+        })
+        .unwrap();
+
+        let normalization = report.normalization.as_ref().unwrap();
+        assert_eq!(report.frame_count, 8);
+        assert_eq!((report.sheet_width, report.sheet_height), (128, 64));
+        assert_eq!(normalization.source_columns, Some(4));
+        assert_eq!(normalization.source_rows, Some(2));
+        assert!(normalization
+            .grid_detection
+            .contains("individual_generated_frames_sorted"));
+        assert!(output.join("atlas.json").exists());
+        assert!(output.join("aseprite.json").exists());
+        assert!(output.join("spritesheet_normalization.json").exists());
+        assert!(output.join("frames/walk_0000.png").exists());
+        let sheet = decode_image(&output.join("sheet.png")).unwrap();
+        assert_eq!(sheet.get_pixel(0, 0)[3], 0);
+    }
+
+    #[test]
+    fn animation_job_accepts_generated_frames_and_assembles() {
+        let temp = TempDir::new().unwrap();
+        let job_dir = temp.path().join("cat_job");
+        let generated = temp.path().join("generated");
+        fs::create_dir_all(&generated).unwrap();
+        let started = start_animation_job(AnimationJobStartOptions {
+            output: job_dir.to_string_lossy().to_string(),
+            action: "cat_walk".to_string(),
+            frame_count: 8,
+            columns: 4,
+            prefix: "cat_walk".to_string(),
+            frame_width: 64,
+            frame_height: 64,
+        })
+        .unwrap();
+        assert_eq!(started.job.frames.len(), 8);
+        assert!(Path::new(&started.job.frames[0].pose_guide_path).exists());
+
+        for index in 0..8 {
+            let mut frame = RgbaImage::from_pixel(96, 96, Rgba([38, 40, 42, 255]));
+            let sway = (index % 3) as u32;
+            for y in 28..58 {
+                for x in 24 + sway..70 + sway {
+                    frame.put_pixel(x, y, Rgba([240, 120, 32, 255]));
+                }
+            }
+            for y in 22..46 {
+                for x in 60 + sway..82 + sway {
+                    frame.put_pixel(x, y, Rgba([250, 150, 64, 255]));
+                }
+            }
+            for (paw_x, paw_w) in [
+                (22 + sway, 8),
+                (42 + sway, 8),
+                (58 + sway, 8),
+                (74 + sway, 7),
+            ] {
+                for y in 66..76 {
+                    for x in paw_x..paw_x + paw_w {
+                        frame.put_pixel(x, y, Rgba([255, 212, 164, 255]));
+                    }
+                }
+            }
+            let path = generated.join(format!("{index:03}.png"));
+            frame.save(&path).unwrap();
+            let submitted = submit_animation_job_frame(AnimationJobSubmitFrameOptions {
+                job_dir: job_dir.to_string_lossy().to_string(),
+                frame_index: index,
+                source_path: path.to_string_lossy().to_string(),
+                force_accept: false,
+            })
+            .unwrap();
+            assert!(submitted.accepted, "{:?}", submitted.errors);
+        }
+
+        let report = assemble_animation_job(AnimationJobAssembleOptions {
+            job_dir: job_dir.to_string_lossy().to_string(),
+            output: None,
+            format: "png".to_string(),
+            aseprite_json: true,
+        })
+        .unwrap();
+
+        assert_eq!(report.frame_count, 8);
+        assert!(Path::new(&started.job.assembled_dir)
+            .join("atlas.json")
+            .exists());
+        assert!(Path::new(&started.job.assembled_dir)
+            .join("spritesheet_normalization.json")
+            .exists());
+    }
+
+    #[test]
+    fn animation_job_rejects_cat_frame_without_readable_paw_contacts() {
+        let temp = TempDir::new().unwrap();
+        let job_dir = temp.path().join("cat_job");
+        let source_path = temp.path().join("blob.png");
+        let started = start_animation_job(AnimationJobStartOptions {
+            output: job_dir.to_string_lossy().to_string(),
+            action: "cat_walk".to_string(),
+            frame_count: 8,
+            columns: 4,
+            prefix: "cat_walk".to_string(),
+            frame_width: 64,
+            frame_height: 64,
+        })
+        .unwrap();
+        let mut frame = RgbaImage::from_pixel(96, 96, Rgba([38, 40, 42, 255]));
+        for y in 24..76 {
+            for x in 24..72 {
+                frame.put_pixel(x, y, Rgba([240, 120, 32, 255]));
+            }
+        }
+        frame.save(&source_path).unwrap();
+
+        let submitted = submit_animation_job_frame(AnimationJobSubmitFrameOptions {
+            job_dir: job_dir.to_string_lossy().to_string(),
+            frame_index: 0,
+            source_path: source_path.to_string_lossy().to_string(),
+            force_accept: false,
+        })
+        .unwrap();
+
+        assert!(!submitted.accepted);
+        assert!(submitted
+            .errors
+            .iter()
+            .any(|error| error.contains("readable paw-contact clusters")));
+        assert!(Path::new(&started.job.frames[0].pose_guide_path).exists());
     }
 
     #[test]

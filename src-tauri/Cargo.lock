@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "sprite-atlas-packer"
-version = "0.1.0"
+version = "26.6.19"
 dependencies = [
  "base64 0.22.1",
  "dirs",
