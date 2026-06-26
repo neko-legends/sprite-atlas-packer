@@ -46,17 +46,17 @@ const AGENT_API_REGISTRY_FILE: &str = "agent-api-registry.json";
 const SAP_DEFAULT_PORT: u16 = 9877;
 const SAP_BIND_ADDRESS: &str = "127.0.0.1";
 #[cfg(feature = "desktop")]
-const DEFAULT_WINDOW_WIDTH: u32 = 1280;
+const DEFAULT_WINDOW_WIDTH: u32 = 1920;
 #[cfg(feature = "desktop")]
-const DEFAULT_WINDOW_HEIGHT: u32 = 820;
+const DEFAULT_WINDOW_HEIGHT: u32 = 1080;
 #[cfg(feature = "desktop")]
 const MIN_WINDOW_WIDTH: u32 = 860;
 #[cfg(feature = "desktop")]
 const MIN_WINDOW_HEIGHT: u32 = 540;
 #[cfg(feature = "desktop")]
-const LANDSCAPE_WINDOW_WIDTH_RATIO: f64 = 0.5;
+const SMALL_MONITOR_WIDTH_RATIO: f64 = 0.94;
 #[cfg(feature = "desktop")]
-const PORTRAIT_WINDOW_WIDTH_RATIO: f64 = 0.9;
+const SMALL_MONITOR_HEIGHT_RATIO: f64 = 0.9;
 const GENERATED_GRID_POLICY: &str =
     "auto_detect_grid_from_sprite_distances_then_fallback_proportional";
 const GENERATED_PROPORTION_POLICY: &str = "global_uniform_scale_preserve_sprite_proportions";
@@ -913,20 +913,26 @@ fn clamp_window_dimension(value: u32, min: u32, monitor_max: u32) -> u32 {
 
 #[cfg(feature = "desktop")]
 fn initial_window_size(monitor_width: u32, monitor_height: u32) -> tauri::PhysicalSize<u32> {
-    let width_ratio = if monitor_width < monitor_height {
-        PORTRAIT_WINDOW_WIDTH_RATIO
-    } else {
-        LANDSCAPE_WINDOW_WIDTH_RATIO
-    };
     let aspect = DEFAULT_WINDOW_HEIGHT as f64 / DEFAULT_WINDOW_WIDTH as f64;
-    let mut width = (monitor_width as f64 * width_ratio).round();
-    let mut height = (width * aspect).round();
-    let max_height = (monitor_height as f64 * 0.9).round().max(1.0);
-
-    if height > max_height {
-        height = max_height;
-        width = (height / aspect).round();
-    }
+    let max_width = if monitor_width >= DEFAULT_WINDOW_WIDTH {
+        DEFAULT_WINDOW_WIDTH as f64
+    } else {
+        (monitor_width as f64 * SMALL_MONITOR_WIDTH_RATIO)
+            .round()
+            .max(1.0)
+    };
+    let max_height = if monitor_height >= DEFAULT_WINDOW_HEIGHT {
+        DEFAULT_WINDOW_HEIGHT as f64
+    } else {
+        (monitor_height as f64 * SMALL_MONITOR_HEIGHT_RATIO)
+            .round()
+            .max(1.0)
+    };
+    let scale = (max_width / DEFAULT_WINDOW_WIDTH as f64)
+        .min(max_height / DEFAULT_WINDOW_HEIGHT as f64)
+        .min(1.0);
+    let width = (DEFAULT_WINDOW_WIDTH as f64 * scale).round();
+    let height = (width * aspect).round();
 
     tauri::PhysicalSize::new(width.max(1.0) as u32, height.max(1.0) as u32)
 }
@@ -955,7 +961,14 @@ fn apply_initial_window_size(app: &tauri::App) {
         clamp_window_dimension(size.width, MIN_WINDOW_WIDTH, monitor_width),
         clamp_window_dimension(size.height, MIN_WINDOW_HEIGHT, monitor_height),
     );
+    let min_size = tauri::PhysicalSize::new(
+        MIN_WINDOW_WIDTH.min(monitor_width.max(1)),
+        MIN_WINDOW_HEIGHT.min(monitor_height.max(1)),
+    );
 
+    if let Err(error) = window.set_min_size(Some(tauri::Size::Physical(min_size))) {
+        eprintln!("Failed to initialize minimum window size: {error}");
+    }
     if let Err(error) = window.set_size(tauri::Size::Physical(size)) {
         eprintln!("Failed to initialize window size: {error}");
     }

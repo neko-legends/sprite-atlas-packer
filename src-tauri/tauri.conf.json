@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "Sprite Atlas Packer",
-        "width": 1280,
-        "height": 820,
+        "width": 1920,
+        "height": 1080,
         "minWidth": 860,
         "minHeight": 540,
         "dragDropEnabled": true,

@@ -2854,7 +2854,7 @@ function App() {
             </div>
             <div className="log-list">
               {(log.length ? log : ['Ready.']).map((line, index) => (
-                <div key={`${line}-${index}`}>{line}</div>
+                <div className="log-line" key={`${line}-${index}`}>{line}</div>
               ))}
             </div>
           </section>

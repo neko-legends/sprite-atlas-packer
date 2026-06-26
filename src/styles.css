@@ -787,15 +787,17 @@ button {
 
 .report-list,
 .log-list {
-  display: grid;
-  align-content: start;
-  gap: 6px;
   min-height: 0;
   overflow: auto;
 }
 
-.report-row,
-.log-list div {
+.report-list {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.report-row {
   min-width: 0;
   padding: 7px 8px;
   border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
@@ -805,15 +807,35 @@ button {
   font-size: 12px;
 }
 
-.report-row span,
-.log-list div {
+.report-row span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .log-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   flex: 0 0 132px;
+}
+
+.log-list {
+  min-height: 0;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, #050505 84%, var(--surface-2));
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.log-line {
+  min-width: 0;
+  padding: 1px 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .spin {
