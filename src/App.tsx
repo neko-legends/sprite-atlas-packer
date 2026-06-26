@@ -27,7 +27,7 @@ import {
   Upload,
   Video,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent as ReactDragEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent as ReactDragEvent, type SyntheticEvent } from 'react'
 
 type OutputFormat = 'webp' | 'png' | 'both'
 type PackingStrategy = 'maxrects' | 'shelf' | 'guillotine' | 'quadtree'
@@ -85,6 +85,7 @@ type VideoOptions = {
   endTime: number
   fps: number
   prefix: string
+  autoMakeSheet: boolean
 }
 
 type PackReport = {
@@ -248,6 +249,7 @@ const defaultVideoOptions: VideoOptions = {
   endTime: 0,
   fps: 12,
   prefix: 'video_walk',
+  autoMakeSheet: false,
 }
 
 function isTauriRuntime(): boolean {
@@ -491,6 +493,12 @@ function videoMimeTypeFromPath(value: string): string {
   if (extension === 'webm') return 'video/webm'
   if (extension === 'mov') return 'video/quicktime'
   return 'video/mp4'
+}
+
+function videoLoadedNotice(name: string, autoMakeSheet: boolean): string {
+  return autoMakeSheet
+    ? `Video set to ${name} — making sprite sheet after load`
+    : `Video set to ${name} — adjust grid and click Make Sprite Sheet`
 }
 
 function localPathFromFileUri(value: string): string | null {
@@ -1215,6 +1223,7 @@ function App() {
   const [log, setLog] = useState<string[]>([])
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const videoObjectUrlRef = useRef<string>('')
+  const autoVideoRunKeyRef = useRef('')
   const browserSourceInputRef = useRef<HTMLInputElement | null>(null)
   const browserSheetInputRef = useRef<HTMLInputElement | null>(null)
   const browserVideoInputRef = useRef<HTMLInputElement | null>(null)
@@ -1282,7 +1291,8 @@ function App() {
       setComparison(null)
       setVideoDuration(0)
       setVideoPreviewGif('')
-      setNotice(`Video set to ${fileName(path)} — adjust grid and click Make Sprite Sheet`)
+      autoVideoRunKeyRef.current = ''
+      setNotice(videoLoadedNotice(fileName(path), videoOptions.autoMakeSheet))
       pushLog(`Video source routed from drop/pick: ${path}`)
 
       if (!desktopRuntime) return
@@ -1300,7 +1310,7 @@ function App() {
         pushLog(`Video file read failed: ${message}`)
       }
     },
-    [desktopRuntime, pushLog, videoOptions.output],
+    [desktopRuntime, pushLog, videoOptions.autoMakeSheet, videoOptions.output],
   )
 
   const setSourcePath = useCallback(
@@ -1372,7 +1382,8 @@ function App() {
         setVideoSourceUrl(sourceUrl)
         setVideoDuration(0)
         setVideoPreviewGif('')
-        setNotice(`Video set to ${videoFile.name} — adjust grid and click Make Sprite Sheet`)
+        autoVideoRunKeyRef.current = ''
+        setNotice(videoLoadedNotice(videoFile.name, videoOptions.autoMakeSheet))
         pushLog(`${source}: loaded video ${videoFile.name}.`)
         return true
       }
@@ -1380,7 +1391,7 @@ function App() {
       await loadBrowserFileForInspection(file, source)
       return true
     },
-    [loadBrowserFileForInspection, options.output, pushLog],
+    [loadBrowserFileForInspection, options.output, pushLog, videoOptions.autoMakeSheet],
   )
 
   const loadLocalPathsForInspection = useCallback(
@@ -1730,7 +1741,8 @@ function App() {
     setVideoSourceUrl(sourceUrl)
     setVideoDuration(0)
     setVideoPreviewGif('')
-    setNotice(`Video set to ${file.name}`)
+    autoVideoRunKeyRef.current = ''
+    setNotice(videoLoadedNotice(file.name, videoOptions.autoMakeSheet))
     pushLog(`Browser video source: ${file.name}`)
   }
 
@@ -1756,6 +1768,7 @@ function App() {
   }
 
   async function runVideoToSpriteSheet() {
+    if (busy) return
     if (!isTauriRuntime()) {
       setNotice('Desktop runtime required for video extraction')
       return
@@ -1781,8 +1794,8 @@ function App() {
     setInspectedPreview(null)
     setSheetPreview('')
     setComparison(null)
-      setVideoPreviewGif('')
-      setNotice('Loading video...')
+    setVideoPreviewGif('')
+    setNotice('Loading video...')
     try {
       if (!videoSourceUrl) {
         setNotice('Video preview is still loading')
@@ -1870,6 +1883,23 @@ function App() {
       setBusy(false)
     }
   }
+
+  function handleVideoMetadataLoaded(event: SyntheticEvent<HTMLVideoElement>) {
+    const duration = Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0
+    setVideoDuration(duration)
+    setVideoOptions((current) => ({
+      ...current,
+      endTime: current.endTime > 0 && current.endTime <= duration ? current.endTime : duration,
+    }))
+  }
+
+  useEffect(() => {
+    if (!videoOptions.autoMakeSheet || !desktopRuntime || busy || !videoOptions.input || !videoSourceUrl || videoDuration <= 0) return
+    const autoRunKey = `${videoOptions.input}|${videoSourceUrl}`
+    if (autoVideoRunKeyRef.current === autoRunKey) return
+    autoVideoRunKeyRef.current = autoRunKey
+    void runVideoToSpriteSheet()
+  }, [busy, desktopRuntime, videoDuration, videoOptions.autoMakeSheet, videoOptions.input, videoSourceUrl])
 
   async function runPack(dryRun: boolean) {
     if (!desktopRuntime) {
@@ -2265,6 +2295,170 @@ function App() {
 
           <section className="panel-section">
             <div className="section-title">
+              <Video size={16} />
+              Video
+            </div>
+            <div className="folder-row">
+              <input value={compactPath(videoOptions.input)} readOnly />
+              <button className="icon-button compact" type="button" onClick={() => void chooseVideo()} title="Choose video">
+                <Video size={15} />
+              </button>
+            </div>
+            <div className="folder-row">
+              <input value={compactPath(videoOptions.output)} readOnly />
+              <button className="icon-button compact" type="button" onClick={() => void chooseVideoOutput()} title="Choose video output">
+                <FolderOpen size={15} />
+              </button>
+            </div>
+            <label className="toggle-row" title="Run Make Sprite Sheet automatically after a video finishes loading">
+              <input
+                type="checkbox"
+                checked={videoOptions.autoMakeSheet}
+                onChange={(event) => setVideoOptions((current) => ({ ...current, autoMakeSheet: event.currentTarget.checked }))}
+              />
+              <span>Auto make sheet on load</span>
+            </label>
+            {videoSourceUrl ? (
+              <video
+                className="video-source-preview"
+                controls
+                muted
+                playsInline
+                preload="auto"
+                ref={videoRef}
+                src={videoSourceUrl}
+                onLoadedMetadata={handleVideoMetadataLoaded}
+              />
+            ) : (
+              <div className="video-source-empty">No video selected</div>
+            )}
+            <div className="format-toggle three">
+              {(['4x4', '5x5', 'custom'] as VideoGridPreset[]).map((gridPreset) => (
+                <button
+                  className={classNames('format-button', videoOptions.gridPreset === gridPreset && 'active')}
+                  key={gridPreset}
+                  type="button"
+                  onClick={() => setVideoGridPreset(gridPreset)}
+                >
+                  {gridPreset.toUpperCase()}
+                </button>
+              ))}
+            </div>
+            <div className="cell-grid">
+              <label>
+                <span>Columns</span>
+                <input
+                  min={1}
+                  max={16}
+                  type="number"
+                  value={videoOptions.columns}
+                  onChange={(event) =>
+                    setVideoOptions((current) => ({
+                      ...current,
+                      gridPreset: 'custom',
+                      columns: Math.max(1, Math.min(16, Number(event.currentTarget.value) || 1)),
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>Rows</span>
+                <input
+                  min={1}
+                  max={16}
+                  type="number"
+                  value={videoOptions.rows}
+                  onChange={(event) =>
+                    setVideoOptions((current) => ({
+                      ...current,
+                      gridPreset: 'custom',
+                      rows: Math.max(1, Math.min(16, Number(event.currentTarget.value) || 1)),
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>Frame W</span>
+                <input
+                  min={16}
+                  type="number"
+                  value={videoOptions.frameWidth}
+                  onChange={(event) => setVideoOptions((current) => ({ ...current, frameWidth: Math.max(16, Number(event.currentTarget.value) || 16) }))}
+                />
+              </label>
+              <label>
+                <span>Frame H</span>
+                <input
+                  min={16}
+                  type="number"
+                  value={videoOptions.frameHeight}
+                  onChange={(event) => setVideoOptions((current) => ({ ...current, frameHeight: Math.max(16, Number(event.currentTarget.value) || 16) }))}
+                />
+              </label>
+              <label>
+                <span>Start</span>
+                <input
+                  min={0}
+                  step={0.05}
+                  type="number"
+                  value={Number(videoOptions.startTime.toFixed(2))}
+                  onChange={(event) =>
+                    setVideoOptions((current) => ({
+                      ...current,
+                      startTime: Math.max(0, Number(event.currentTarget.value) || 0),
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>End</span>
+                <input
+                  min={0}
+                  step={0.05}
+                  type="number"
+                  value={Number(videoOptions.endTime.toFixed(2))}
+                  onChange={(event) =>
+                    setVideoOptions((current) => ({
+                      ...current,
+                      endTime: Math.max(0, Number(event.currentTarget.value) || 0),
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>FPS</span>
+                <input
+                  min={1}
+                  max={60}
+                  type="number"
+                  value={videoOptions.fps}
+                  onChange={(event) => setVideoOptions((current) => ({ ...current, fps: Math.max(1, Math.min(60, Number(event.currentTarget.value) || 1)) }))}
+                />
+              </label>
+              <label>
+                <span>Frames</span>
+                <input readOnly value={videoFrameCount} />
+              </label>
+            </div>
+            <label className="field">
+              <span>Prefix</span>
+              <input
+                value={videoOptions.prefix}
+                onChange={(event) => setVideoOptions((current) => ({ ...current, prefix: event.currentTarget.value }))}
+              />
+            </label>
+            <div className="video-range-note">
+              {videoDuration > 0 ? `${videoRangeSeconds.toFixed(2)}s sampled from ${videoDuration.toFixed(2)}s` : 'Duration loads after video selection'}
+            </div>
+            <button className="secondary-action full" type="button" onClick={() => void runVideoToSpriteSheet()} disabled={!desktopRuntime || !videoOptions.input || busy}>
+              {busy ? <Loader2 className="spin" size={16} /> : <Grid3X3 size={16} />}
+              Make Sprite Sheet
+            </button>
+            {videoPreviewGif ? <img className="video-gif-preview" alt="Video animation preview" src={videoPreviewGif} /> : null}
+          </section>
+
+          <section className="panel-section">
+            <div className="section-title">
               <ImageIcon size={16} />
               Format
             </div>
@@ -2470,169 +2664,6 @@ function App() {
               <FileJson size={16} />
               Copy Token
             </button>
-          </section>
-
-          <section className="panel-section">
-            <div className="section-title">
-              <Video size={16} />
-              Video
-            </div>
-            <div className="folder-row">
-              <input value={compactPath(videoOptions.input)} readOnly />
-              <button className="icon-button compact" type="button" onClick={() => void chooseVideo()} title="Choose video">
-                <Video size={15} />
-              </button>
-            </div>
-            <div className="folder-row">
-              <input value={compactPath(videoOptions.output)} readOnly />
-              <button className="icon-button compact" type="button" onClick={() => void chooseVideoOutput()} title="Choose video output">
-                <FolderOpen size={15} />
-              </button>
-            </div>
-            {videoSourceUrl ? (
-              <video
-                className="video-source-preview"
-                controls
-                muted
-                playsInline
-                preload="auto"
-                ref={videoRef}
-                src={videoSourceUrl}
-                onLoadedMetadata={(event) => {
-                  const duration = Number.isFinite(event.currentTarget.duration) ? event.currentTarget.duration : 0
-                  setVideoDuration(duration)
-                  setVideoOptions((current) => ({
-                    ...current,
-                    endTime: current.endTime > 0 && current.endTime <= duration ? current.endTime : duration,
-                  }))
-                }}
-              />
-            ) : (
-              <div className="video-source-empty">No video selected</div>
-            )}
-            <div className="format-toggle three">
-              {(['4x4', '5x5', 'custom'] as VideoGridPreset[]).map((gridPreset) => (
-                <button
-                  className={classNames('format-button', videoOptions.gridPreset === gridPreset && 'active')}
-                  key={gridPreset}
-                  type="button"
-                  onClick={() => setVideoGridPreset(gridPreset)}
-                >
-                  {gridPreset.toUpperCase()}
-                </button>
-              ))}
-            </div>
-            <div className="cell-grid">
-              <label>
-                <span>Columns</span>
-                <input
-                  min={1}
-                  max={16}
-                  type="number"
-                  value={videoOptions.columns}
-                  onChange={(event) =>
-                    setVideoOptions((current) => ({
-                      ...current,
-                      gridPreset: 'custom',
-                      columns: Math.max(1, Math.min(16, Number(event.currentTarget.value) || 1)),
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>Rows</span>
-                <input
-                  min={1}
-                  max={16}
-                  type="number"
-                  value={videoOptions.rows}
-                  onChange={(event) =>
-                    setVideoOptions((current) => ({
-                      ...current,
-                      gridPreset: 'custom',
-                      rows: Math.max(1, Math.min(16, Number(event.currentTarget.value) || 1)),
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>Frame W</span>
-                <input
-                  min={16}
-                  type="number"
-                  value={videoOptions.frameWidth}
-                  onChange={(event) => setVideoOptions((current) => ({ ...current, frameWidth: Math.max(16, Number(event.currentTarget.value) || 16) }))}
-                />
-              </label>
-              <label>
-                <span>Frame H</span>
-                <input
-                  min={16}
-                  type="number"
-                  value={videoOptions.frameHeight}
-                  onChange={(event) => setVideoOptions((current) => ({ ...current, frameHeight: Math.max(16, Number(event.currentTarget.value) || 16) }))}
-                />
-              </label>
-              <label>
-                <span>Start</span>
-                <input
-                  min={0}
-                  step={0.05}
-                  type="number"
-                  value={Number(videoOptions.startTime.toFixed(2))}
-                  onChange={(event) =>
-                    setVideoOptions((current) => ({
-                      ...current,
-                      startTime: Math.max(0, Number(event.currentTarget.value) || 0),
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>End</span>
-                <input
-                  min={0}
-                  step={0.05}
-                  type="number"
-                  value={Number(videoOptions.endTime.toFixed(2))}
-                  onChange={(event) =>
-                    setVideoOptions((current) => ({
-                      ...current,
-                      endTime: Math.max(0, Number(event.currentTarget.value) || 0),
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                <span>FPS</span>
-                <input
-                  min={1}
-                  max={60}
-                  type="number"
-                  value={videoOptions.fps}
-                  onChange={(event) => setVideoOptions((current) => ({ ...current, fps: Math.max(1, Math.min(60, Number(event.currentTarget.value) || 1)) }))}
-                />
-              </label>
-              <label>
-                <span>Frames</span>
-                <input readOnly value={videoFrameCount} />
-              </label>
-            </div>
-            <label className="field">
-              <span>Prefix</span>
-              <input
-                value={videoOptions.prefix}
-                onChange={(event) => setVideoOptions((current) => ({ ...current, prefix: event.currentTarget.value }))}
-              />
-            </label>
-            <div className="video-range-note">
-              {videoDuration > 0 ? `${videoRangeSeconds.toFixed(2)}s sampled from ${videoDuration.toFixed(2)}s` : 'Duration loads after video selection'}
-            </div>
-            <button className="secondary-action full" type="button" onClick={() => void runVideoToSpriteSheet()} disabled={!desktopRuntime || !videoOptions.input || busy}>
-              {busy ? <Loader2 className="spin" size={16} /> : <Grid3X3 size={16} />}
-              Make Sprite Sheet
-            </button>
-            {videoPreviewGif ? <img className="video-gif-preview" alt="Video animation preview" src={videoPreviewGif} /> : null}
           </section>
 
           <section className="panel-section">
