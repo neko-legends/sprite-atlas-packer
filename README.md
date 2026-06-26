@@ -133,6 +133,12 @@ is ready for game animation import. If the source video already has alpha or a
 transparent/clean keyed subject, that transparency is preserved through the PNG
 frame and atlas pipeline.
 
+AI image generators are still unreliable at producing perfect animation loops
+directly in spritesheet format. For generated character motion, a more reliable
+workflow is to make or clean up a short video first, then use Sprite Atlas Packer
+to sample it into transparent animated GIF previews, PNG frame sequences, and a
+deterministic atlas.
+
 ## Local Control API
 
 Agents can drive a running local server with bearer-token auth. In the desktop
