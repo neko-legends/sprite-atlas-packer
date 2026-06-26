@@ -385,3 +385,8 @@ validates a representative `.atlasproj.json` against
 Rust tests also include a committed golden atlas fixture under
 `tests/golden/basic/`, a deterministic sheet hash check, trim recomposition, and
 bilinear edge sampling to guard against color bleed from neighboring frames.
+
+## Neko Legends Control Center
+
+Sprite Atlas Packer and other Neko Legends tools can be installed through
+[Neko Legends Control Center](https://github.com/neko-legends/NekoLegendsControlCenter).
