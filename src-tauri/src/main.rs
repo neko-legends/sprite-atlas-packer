@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", feature = "desktop"), windows_subsystem = "windows")]
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if !args.iter().any(|arg| arg == "--headless") {

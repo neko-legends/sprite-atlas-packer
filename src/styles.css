@@ -47,6 +47,10 @@ button {
   color: inherit;
 }
 
+.browser-file-input {
+  display: none;
+}
+
 .app-shell {
   display: flex;
   flex-direction: column;
@@ -691,6 +695,14 @@ button {
   background: var(--surface-2);
   color: var(--muted);
   cursor: pointer;
+}
+
+.timeline-thumb.reorderable {
+  cursor: grab;
+}
+
+.timeline-thumb.reorderable:active {
+  cursor: grabbing;
 }
 
 .timeline-thumb.active,

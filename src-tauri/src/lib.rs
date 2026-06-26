@@ -35,7 +35,7 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 const APP_NAME: &str = "sprite-atlas-packer";
-const VERSION: &str = "26.6.19";
+const VERSION: &str = "26.6.25";
 const DEFAULT_DURATION_MS: u32 = 120;
 const DEFAULT_MAX_SIZE: u32 = 16384;
 const RASTER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
@@ -991,8 +991,10 @@ pub fn run() {
             save_project_gui,
             source_snapshot_gui,
             preview_image_data_url,
+            inspect_gif_gui,
             load_atlas_preview_gui,
             export_gif_gui,
+            read_binary_file_gui,
             write_binary_file_gui,
             agent_control_status_gui,
             start_agent_control_gui,
@@ -1157,6 +1159,12 @@ fn preview_image_data_url(path: String) -> std::result::Result<String, String> {
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+fn inspect_gif_gui(path: String) -> std::result::Result<AtlasPreviewLoad, String> {
+    inspect_gif_preview(Path::new(&path)).map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 fn load_atlas_preview_gui(path: String) -> std::result::Result<AtlasPreviewLoad, String> {
     let atlas_path = PathBuf::from(path);
     let atlas: Atlas =
@@ -1210,6 +1218,12 @@ fn export_gif_gui(options: GuiGifExportOptions) -> std::result::Result<GifExport
         options.frame_end,
     )
     .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+fn read_binary_file_gui(path: String) -> std::result::Result<Vec<u8>, String> {
+    fs::read(Path::new(&path)).map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "desktop")]
@@ -5996,6 +6010,147 @@ fn load_sources_from_path(path: &Path, trim: bool) -> Result<Vec<SourceSprite>> 
     Ok(vec![load_source(path, trim)?])
 }
 
+#[cfg(any(test, feature = "desktop"))]
+fn gif_delay_ms(delay: Delay) -> u32 {
+    let (numerator, denominator) = delay.numer_denom_ms();
+    if denominator == 0 {
+        return DEFAULT_DURATION_MS;
+    }
+    let rounded = ((numerator as u64 + (denominator as u64 / 2)) / denominator as u64)
+        .min(u32::MAX as u64) as u32;
+    if rounded == 0 {
+        DEFAULT_DURATION_MS
+    } else {
+        rounded
+    }
+}
+
+#[cfg(any(test, feature = "desktop"))]
+fn inspect_gif_preview(path: &Path) -> Result<AtlasPreviewLoad> {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("gif"))
+        .unwrap_or(false)
+    {
+        return Err(AtlasError::Message(format!(
+            "GIF inspection requires a .gif file: {}",
+            path.display()
+        )));
+    }
+
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let decoder = image::codecs::gif::GifDecoder::new(reader)?;
+    let frames = decoder.into_frames().collect_frames()?;
+    if frames.is_empty() {
+        return Err(AtlasError::Message(format!(
+            "GIF has no frames: {}",
+            path.display()
+        )));
+    }
+
+    let cell_width = frames
+        .iter()
+        .map(|frame| frame.buffer().width())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let cell_height = frames
+        .iter()
+        .map(|frame| frame.buffer().height())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let frame_count = frames.len() as u32;
+    let columns = (frame_count as f64).sqrt().ceil().max(1.0) as u32;
+    let rows = frame_count.div_ceil(columns).max(1);
+    let mut sheet = RgbaImage::from_pixel(
+        cell_width.saturating_mul(columns),
+        cell_height.saturating_mul(rows),
+        Rgba([0, 0, 0, 0]),
+    );
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("gif");
+    let mut atlas_frames = Vec::with_capacity(frames.len());
+    let mut animation_frames = Vec::with_capacity(frames.len());
+    let mut total_duration_ms = 0u64;
+
+    for (index, frame) in frames.iter().enumerate() {
+        let index = index as u32;
+        let column = index % columns;
+        let row = index / columns;
+        let x = column.saturating_mul(cell_width);
+        let y = row.saturating_mul(cell_height);
+        overlay(&mut sheet, frame.buffer(), x.into(), y.into());
+
+        let duration_ms = gif_delay_ms(frame.delay());
+        total_duration_ms += duration_ms as u64;
+        let filename = format!("{stem}_{index:04}");
+        animation_frames.push(filename.clone());
+        atlas_frames.push(Frame {
+            filename,
+            frame: JsonRect {
+                x,
+                y,
+                w: cell_width,
+                h: cell_height,
+            },
+            rotated: false,
+            trimmed: false,
+            sprite_source_size: JsonRect {
+                x: 0,
+                y: 0,
+                w: cell_width,
+                h: cell_height,
+            },
+            source_size: Size {
+                w: cell_width,
+                h: cell_height,
+            },
+            pivot: Pivot { x: 0.5, y: 0.5 },
+            duration_ms: Some(duration_ms),
+        });
+    }
+
+    let average_duration = (total_duration_ms as f32 / frames.len().max(1) as f32).max(1.0);
+    let sheet_name = format!("{stem}_inspect_sheet.png");
+    let sheet_data_url = format!(
+        "data:image/png;base64,{}",
+        general_purpose::STANDARD.encode(encode_png(&sheet)?)
+    );
+    let atlas = Atlas {
+        meta: Meta {
+            app: APP_NAME.to_string(),
+            version: VERSION.to_string(),
+            image: sheet_name.clone(),
+            size: Size {
+                w: sheet.width(),
+                h: sheet.height(),
+            },
+            format: "RGBA8888".to_string(),
+            scale: 1.0,
+            trimmed: false,
+        },
+        frames: atlas_frames,
+        animations: vec![Animation {
+            name: stem.to_string(),
+            frames: animation_frames,
+            looped: true,
+            fps_hint: (1000.0 / average_duration).clamp(1.0, 60.0),
+        }],
+    };
+
+    Ok(AtlasPreviewLoad {
+        atlas_path: path.to_string_lossy().to_string(),
+        sheet_path: format!("{}#{sheet_name}", path.display()),
+        sheet_data_url,
+        atlas,
+    })
+}
+
 struct TemporaryDirectory {
     path: PathBuf,
 }
@@ -7349,6 +7504,25 @@ mod tests {
         let decoded = decode_image(&path).unwrap();
         assert_eq!(decoded.dimensions(), (3, 2));
         assert_eq!(decoded.get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn gif_inspection_preview_loads_all_frames() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("walk.gif");
+        write_two_frame_gif(&path);
+
+        let preview = inspect_gif_preview(&path).unwrap();
+
+        assert_eq!(preview.atlas.frames.len(), 2);
+        assert_eq!(preview.atlas.animations.len(), 1);
+        assert_eq!(
+            preview.atlas.animations[0].frames,
+            vec!["walk_0000".to_string(), "walk_0001".to_string()]
+        );
+        assert_eq!(preview.atlas.frames[0].duration_ms, Some(80));
+        assert_eq!(preview.atlas.frames[1].duration_ms, Some(80));
+        assert!(preview.sheet_data_url.starts_with("data:image/png;base64,"));
     }
 
     #[test]

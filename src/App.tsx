@@ -1,7 +1,8 @@
-import { convertFileSrc, invoke, isTauri } from '@tauri-apps/api/core'
+import { invoke, isTauri } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 import { open } from '@tauri-apps/plugin-dialog'
 import { save } from '@tauri-apps/plugin-dialog'
+import { decompressFrames, parseGIF, type ParsedFrame } from 'gifuct-js'
 import {
   BoxSelect,
   CheckCircle2,
@@ -26,7 +27,7 @@ import {
   Upload,
   Video,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent as ReactDragEvent } from 'react'
 
 type OutputFormat = 'webp' | 'png' | 'both'
 type PackingStrategy = 'maxrects' | 'shelf' | 'guillotine' | 'quadtree'
@@ -212,7 +213,8 @@ type Size = {
 }
 
 const SETTINGS_KEY = 'spriteAtlasPacker.settings.v1'
-const APP_VERSION_LABEL = 'v26.6.19'
+const APP_VERSION_LABEL = 'v26.6.25'
+const DEFAULT_GIF_FRAME_DURATION_MS = 120
 
 const defaultOptions: PackOptions = {
   input: '',
@@ -476,6 +478,215 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   })
 }
 
+function isGifPath(value: string): boolean {
+  return /\.gif(?:$|[?#])/i.test(value)
+}
+
+function isVideoPath(value: string): boolean {
+  return /\.(?:mp4|webm|mov|m4v)(?:$|[?#])/i.test(value)
+}
+
+function videoMimeTypeFromPath(value: string): string {
+  const extension = value.split(/[?#]/, 1)[0].split('.').pop()?.toLowerCase()
+  if (extension === 'webm') return 'video/webm'
+  if (extension === 'mov') return 'video/quicktime'
+  return 'video/mp4'
+}
+
+function localPathFromFileUri(value: string): string | null {
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'file:') return null
+    const decoded = decodeURIComponent(url.pathname)
+    const windowsPath = decoded.replace(/^\/([A-Za-z]:)/, '$1').replace(/\//g, '\\')
+    return windowsPath || null
+  } catch {
+    return null
+  }
+}
+
+function normalizeLocalPath(value: string): string {
+  const trimmed = value.trim().replace(/^["']|["']$/g, '')
+  return localPathFromFileUri(trimmed) ?? trimmed
+}
+
+function localPathsFromText(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'))
+    .map(normalizeLocalPath)
+}
+
+function localPathsFromDataTransfer(dataTransfer: DataTransfer): string[] {
+  const values = [dataTransfer.getData('text/uri-list'), dataTransfer.getData('text/plain')]
+  return values.flatMap(localPathsFromText).filter(Boolean)
+}
+
+function isGifFile(file: File): boolean {
+  return file.type === 'image/gif' || isGifPath(file.name)
+}
+
+function shouldIgnorePasteTarget(target: EventTarget | null): boolean {
+  const element = target instanceof HTMLElement ? target : null
+  return Boolean(element?.closest('input:not([readonly]), textarea, [contenteditable="true"]'))
+}
+
+function averageFrameDuration(frames: AtlasFrame[]): number {
+  if (!frames.length) return DEFAULT_GIF_FRAME_DURATION_MS
+  return frames.reduce((total, frame) => total + (frame.duration_ms ?? DEFAULT_GIF_FRAME_DURATION_MS), 0) / frames.length
+}
+
+async function dataUrlFromFile(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}`))
+    reader.readAsDataURL(file)
+  })
+}
+
+async function imageSizeFromSource(src: string): Promise<Size> {
+  const image = await loadImage(src)
+  return { w: image.naturalWidth || image.width || 1, h: image.naturalHeight || image.height || 1 }
+}
+
+function atlasForSingleImage(name: string, size: Size): Atlas {
+  const frameName = name.replace(/\.[^.]+$/, '') || 'image'
+  return {
+    meta: {
+      image: name,
+      size,
+    },
+    frames: [
+      {
+        filename: frameName,
+        frame: { x: 0, y: 0, w: size.w, h: size.h },
+        rotated: false,
+        trimmed: false,
+        spriteSourceSize: { x: 0, y: 0, w: size.w, h: size.h },
+        sourceSize: size,
+        pivot: { x: 0.5, y: 0.5 },
+        duration_ms: DEFAULT_GIF_FRAME_DURATION_MS,
+      },
+    ],
+    animations: [{ name: frameName, frames: [frameName], loop: true, fps_hint: 8 }],
+  }
+}
+
+async function inspectBrowserImageFile(file: File): Promise<AtlasPreviewLoad> {
+  const sheetDataUrl = await dataUrlFromFile(file)
+  const size = await imageSizeFromSource(sheetDataUrl)
+  return {
+    atlasPath: file.name,
+    sheetPath: file.name,
+    sheetDataUrl,
+    atlas: atlasForSingleImage(file.name, size),
+  }
+}
+
+async function inspectBrowserGifFile(file: File): Promise<AtlasPreviewLoad> {
+  const parsed = parseGIF(await file.arrayBuffer())
+  const frames = decompressFrames(parsed, true)
+  if (!frames.length) throw new Error(`GIF has no frames: ${file.name}`)
+
+  const width = Math.max(1, parsed.lsd.width)
+  const height = Math.max(1, parsed.lsd.height)
+  const columns = Math.max(1, Math.ceil(Math.sqrt(frames.length)))
+  const rows = Math.max(1, Math.ceil(frames.length / columns))
+  const stage = document.createElement('canvas')
+  const stageContext = stage.getContext('2d')
+  const sheet = document.createElement('canvas')
+  const sheetContext = sheet.getContext('2d')
+  if (!stageContext || !sheetContext) throw new Error('Canvas drawing is unavailable')
+  stage.width = width
+  stage.height = height
+  sheet.width = width * columns
+  sheet.height = height * rows
+  stageContext.clearRect(0, 0, width, height)
+  sheetContext.clearRect(0, 0, sheet.width, sheet.height)
+
+  let previousFrame: ParsedFrame | null = null
+  let previousRestore: ImageData | null = null
+  const stem = file.name.replace(/\.[^.]+$/, '') || 'gif'
+  const atlasFrames: AtlasFrame[] = []
+  const animationFrames: string[] = []
+
+  frames.forEach((frame, index) => {
+    if (previousFrame?.disposalType === 2) {
+      stageContext.clearRect(previousFrame.dims.left, previousFrame.dims.top, previousFrame.dims.width, previousFrame.dims.height)
+    } else if (previousFrame?.disposalType === 3 && previousRestore) {
+      stageContext.putImageData(previousRestore, 0, 0)
+    }
+
+    const restoreForFrame = frame.disposalType === 3 ? stageContext.getImageData(0, 0, width, height) : null
+    stageContext.putImageData(new ImageData(new Uint8ClampedArray(frame.patch), frame.dims.width, frame.dims.height), frame.dims.left, frame.dims.top)
+
+    const column = index % columns
+    const row = Math.floor(index / columns)
+    const x = column * width
+    const y = row * height
+    sheetContext.drawImage(stage, x, y)
+
+    const filename = `${stem}_${String(index).padStart(4, '0')}`
+    const duration = Math.max(1, Math.round(frame.delay || DEFAULT_GIF_FRAME_DURATION_MS))
+    animationFrames.push(filename)
+    atlasFrames.push({
+      filename,
+      frame: { x, y, w: width, h: height },
+      rotated: false,
+      trimmed: false,
+      spriteSourceSize: { x: 0, y: 0, w: width, h: height },
+      sourceSize: { w: width, h: height },
+      pivot: { x: 0.5, y: 0.5 },
+      duration_ms: duration,
+    })
+    previousFrame = frame
+    previousRestore = restoreForFrame
+  })
+
+  const averageDuration = averageFrameDuration(atlasFrames)
+  const sheetName = `${stem}_inspect_sheet.png`
+  return {
+    atlasPath: file.name,
+    sheetPath: sheetName,
+    sheetDataUrl: sheet.toDataURL('image/png'),
+    atlas: {
+      meta: {
+        image: sheetName,
+        size: { w: sheet.width, h: sheet.height },
+      },
+      frames: atlasFrames,
+      animations: [{ name: stem, frames: animationFrames, loop: true, fps_hint: clamp(1000 / averageDuration, 1, 60) }],
+    },
+  }
+}
+
+function reorderItems<T>(items: T[], fromIndex: number, toIndex: number): T[] {
+  if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0 || fromIndex >= items.length || toIndex >= items.length) return items
+  const next = [...items]
+  const [item] = next.splice(fromIndex, 1)
+  next.splice(toIndex, 0, item)
+  return next
+}
+
+function reorderAtlasAnimation(atlas: Atlas, animationName: string, fromIndex: number, toIndex: number): Atlas {
+  const animations = atlas.animations?.length
+    ? atlas.animations
+    : [{ name: 'frames', frames: atlas.frames.map((frame) => frame.filename), loop: true, fps_hint: 8 }]
+  const frameByName = new Map(atlas.frames.map((frame) => [frame.filename, frame]))
+  const nextAnimations = animations.map((animation) =>
+    animation.name === animationName ? { ...animation, frames: reorderItems(animation.frames, fromIndex, toIndex) } : animation,
+  )
+  const activeAnimation = nextAnimations.find((animation) => animation.name === animationName) ?? nextAnimations[0]
+  const activeNames = new Set(activeAnimation.frames)
+  const reorderedFrames = [
+    ...activeAnimation.frames.map((name) => frameByName.get(name)).filter((frame): frame is AtlasFrame => Boolean(frame)),
+    ...atlas.frames.filter((frame) => !activeNames.has(frame.filename)),
+  ]
+  return { ...atlas, frames: reorderedFrames, animations: nextAnimations }
+}
+
 function drawAtlasFrame(context: CanvasRenderingContext2D, image: HTMLImageElement, frame: AtlasFrame, width: number, height: number) {
   context.clearRect(0, 0, width, height)
   context.imageSmoothingEnabled = false
@@ -567,15 +778,18 @@ function AtlasPreview({
   title = 'Animation Preview',
   onExportGif,
   onExportWebm,
+  onReorderFrames,
 }: {
   atlas: Atlas
   sheetSrc: string
   title?: string
   onExportGif?: (animation: string, fpsOverride: number, frameStart: number, frameEnd: number) => void
   onExportWebm?: (animation: string, fpsOverride: number, frameStart: number, frameEnd: number) => void
+  onReorderFrames?: (animation: string, fromIndex: number, toIndex: number) => void
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const imageRef = useRef<HTMLImageElement | null>(null)
+  const draggedFrameIndexRef = useRef<number | null>(null)
   const [imageReady, setImageReady] = useState(false)
   const [animationName, setAnimationName] = useState(atlas.animations?.[0]?.name ?? '')
   const [frameIndex, setFrameIndex] = useState(0)
@@ -725,6 +939,26 @@ function AtlasPreview({
     setFrameIndex((current) => clamp(current + delta, rangeStartIndex, rangeEndIndex))
   }
 
+  function handleFrameDragStart(event: ReactDragEvent<HTMLButtonElement>, index: number) {
+    if (!onReorderFrames) return
+    draggedFrameIndexRef.current = index
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', String(index))
+  }
+
+  function handleFrameDrop(event: ReactDragEvent<HTMLButtonElement>, index: number) {
+    if (!onReorderFrames) return
+    event.preventDefault()
+    const fromText = event.dataTransfer.getData('text/plain')
+    const fallbackIndex = draggedFrameIndexRef.current
+    const fromIndex = fromText ? Number(fromText) : fallbackIndex
+    draggedFrameIndexRef.current = null
+    if (typeof fromIndex !== 'number' || !Number.isInteger(fromIndex) || fromIndex === index) return
+    setPlaying(false)
+    onReorderFrames(activeAnimation.name, fromIndex, index)
+    setFrameIndex(index)
+  }
+
   return (
     <section className="preview-panel animator-panel">
       <div className="preview-head">
@@ -861,12 +1095,15 @@ function AtlasPreview({
             frame={frame}
             image={imageRef.current}
             imageReady={imageReady}
+            reorderable={Boolean(onReorderFrames)}
             selected={index >= rangeStartIndex && index <= rangeEndIndex}
             key={frame.filename}
             onClick={() => {
               setPlaying(false)
               setFrameIndex(index)
             }}
+            onDragStart={(event) => handleFrameDragStart(event, index)}
+            onDrop={(event) => handleFrameDrop(event, index)}
           />
         ))}
       </div>
@@ -879,15 +1116,21 @@ function FrameThumb({
   frame,
   image,
   imageReady,
+  reorderable,
   selected,
   onClick,
+  onDragStart,
+  onDrop,
 }: {
   active: boolean
   frame: AtlasFrame
   image: HTMLImageElement | null
   imageReady: boolean
+  reorderable: boolean
   selected: boolean
   onClick: () => void
+  onDragStart: (event: ReactDragEvent<HTMLButtonElement>) => void
+  onDrop: (event: ReactDragEvent<HTMLButtonElement>) => void
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
 
@@ -920,7 +1163,18 @@ function FrameThumb({
   }, [frame, image, imageReady])
 
   return (
-    <button className={classNames('timeline-thumb', selected && 'selected', active && 'active')} type="button" onClick={onClick} title={frame.filename}>
+    <button
+      className={classNames('timeline-thumb', reorderable && 'reorderable', selected && 'selected', active && 'active')}
+      draggable={reorderable}
+      type="button"
+      onClick={onClick}
+      onDragOver={(event) => {
+        if (reorderable) event.preventDefault()
+      }}
+      onDragStart={onDragStart}
+      onDrop={onDrop}
+      title={frame.filename}
+    >
       <canvas ref={canvasRef} />
       <span>{frame.filename}</span>
     </button>
@@ -953,26 +1207,201 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [sheetPreview, setSheetPreview] = useState<string>('')
+  const [inspectedPreview, setInspectedPreview] = useState<AtlasPreviewLoad | null>(null)
   const [comparison, setComparison] = useState<AtlasPreviewLoad | null>(null)
   const [agentControl, setAgentControl] = useState<AgentControlInfo | null>(null)
   const [hotReload, setHotReload] = useState(false)
   const [hotReloadSignature, setHotReloadSignature] = useState('')
   const [log, setLog] = useState<string[]>([])
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const videoObjectUrlRef = useRef<string>('')
+  const browserSourceInputRef = useRef<HTMLInputElement | null>(null)
+  const browserSheetInputRef = useRef<HTMLInputElement | null>(null)
+  const browserVideoInputRef = useRef<HTMLInputElement | null>(null)
 
-  const canRun = Boolean(options.input.trim()) && Boolean(options.output.trim()) && !busy
+  const desktopRuntime = isTauriRuntime()
+  const canRun = desktopRuntime && Boolean(options.input.trim()) && Boolean(options.output.trim()) && !busy
   const videoFrameCount = Math.max(1, videoOptions.columns * videoOptions.rows)
   const effectiveVideoEnd = videoDuration > 0 && videoOptions.endTime > videoOptions.startTime ? videoOptions.endTime : videoDuration
   const videoRangeSeconds = Math.max(0, effectiveVideoEnd - videoOptions.startTime)
-  const atlasSize = report ? `${report.atlasWidth} x ${report.atlasHeight}` : '0 x 0'
-  const frameCount = report?.frames.length ?? 0
-  const animationCount = report?.animations.length ?? 0
+  const displayedAtlas = inspectedPreview?.atlas ?? report?.atlas ?? sliceReport?.atlas
+  const displayedPreview = sheetPreview
+  const atlasSize = displayedAtlas ? `${displayedAtlas.meta.size.w} x ${displayedAtlas.meta.size.h}` : '0 x 0'
+  const frameCount = displayedAtlas?.frames.length ?? 0
+  const animationCount = displayedAtlas?.animations?.length ?? 0
   const waste = report ? `${report.wastePercent.toFixed(1)}%` : '0.0%'
   const packSignature = useMemo(() => JSON.stringify({ ...options, dryRun: false }), [options])
 
   const pushLog = useCallback((message: string) => {
     setLog((current) => [message, ...current].slice(0, 80))
   }, [])
+
+  const loadGifPathForInspection = useCallback(
+    async (path: string) => {
+      setBusy(true)
+      setReport(null)
+      setSliceReport(null)
+      setComparison(null)
+      setInspectedPreview(null)
+      setSheetPreview('')
+      setNotice(`Inspecting ${fileName(path)}...`)
+      try {
+        const loaded = await invoke<AtlasPreviewLoad>('inspect_gif_gui', { path })
+        setInspectedPreview(loaded)
+        setSheetPreview(loaded.sheetDataUrl)
+        setOptions((current) => ({ ...current, input: path, output: current.output || parentPath(path) }))
+        setSliceOptions((current) => ({ ...current, input: path, output: current.output || parentPath(path) }))
+        const frameTotal = loaded.atlas.frames.length
+        setNotice(`GIF inspect: ${fileName(path)} (${frameTotal} frame${frameTotal === 1 ? '' : 's'})`)
+        pushLog(`GIF inspect loaded ${frameTotal} frame${frameTotal === 1 ? '' : 's'} from ${path}.`)
+      } catch (error) {
+        const message = String(error)
+        setNotice(message)
+        pushLog(`GIF inspect failed: ${message}`)
+      } finally {
+        setBusy(false)
+      }
+    },
+    [pushLog],
+  )
+
+  const loadVideoPath = useCallback(
+    async (path: string) => {
+      const defaultOutput = videoOptions.output || joinPath(parentPath(path), 'sprite-output')
+      setVideoOptions((current) => ({
+        ...current,
+        input: path,
+        output: current.output || defaultOutput,
+        prefix: current.prefix || fileName(path).replace(/\.[^.]+$/, '') || 'video_walk',
+      }))
+      setOptions((current) => ({ ...current, input: '' }))
+      setInspectedPreview(null)
+      setReport(null)
+      setSliceReport(null)
+      setSheetPreview('')
+      setComparison(null)
+      setVideoDuration(0)
+      setVideoPreviewGif('')
+      setNotice(`Video set to ${fileName(path)} — adjust grid and click Make Sprite Sheet`)
+      pushLog(`Video source routed from drop/pick: ${path}`)
+
+      if (!desktopRuntime) return
+
+      try {
+        const bytes = await invoke<number[]>('read_binary_file_gui', { path })
+        const blobUrl = URL.createObjectURL(new Blob([new Uint8Array(bytes)], { type: videoMimeTypeFromPath(path) }))
+        if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current)
+        videoObjectUrlRef.current = blobUrl
+        setVideoSourceUrl(blobUrl)
+      } catch (error) {
+        const message = String(error)
+        setVideoSourceUrl('')
+        setNotice(`Could not load video file: ${message}`)
+        pushLog(`Video file read failed: ${message}`)
+      }
+    },
+    [desktopRuntime, pushLog, videoOptions.output],
+  )
+
+  const setSourcePath = useCallback(
+    (path: string) => {
+      if (isVideoPath(path)) {
+        void loadVideoPath(path)
+        return
+      }
+      if (isGifPath(path)) {
+        void loadGifPathForInspection(path)
+        return
+      }
+      setInspectedPreview(null)
+      setReport(null)
+      setSliceReport(null)
+      setComparison(null)
+      setSheetPreview('')
+      setOptions((current) => ({ ...current, input: path }))
+      setNotice(`Input set to ${fileName(path)}`)
+      pushLog(`Input folder: ${path}`)
+    },
+    [loadGifPathForInspection, pushLog],
+  )
+
+  const loadBrowserFileForInspection = useCallback(
+    async (file: File, source: string) => {
+      setBusy(true)
+      setReport(null)
+      setSliceReport(null)
+      setComparison(null)
+      setInspectedPreview(null)
+      setSheetPreview('')
+      setNotice(`Inspecting ${file.name}...`)
+      try {
+        const loaded = isGifFile(file) ? await inspectBrowserGifFile(file) : await inspectBrowserImageFile(file)
+        setInspectedPreview(loaded)
+        setSheetPreview(loaded.sheetDataUrl)
+        setOptions((current) => ({ ...current, input: file.name }))
+        setSliceOptions((current) => ({ ...current, input: file.name, output: current.output || options.output }))
+        const frameTotal = loaded.atlas.frames.length
+        setNotice(`${isGifFile(file) ? 'GIF' : 'Image'} inspect: ${file.name} (${frameTotal} frame${frameTotal === 1 ? '' : 's'})`)
+        pushLog(`${source}: loaded ${file.name} with ${frameTotal} frame${frameTotal === 1 ? '' : 's'} for inspection.`)
+      } catch (error) {
+        const message = String(error)
+        setNotice(message)
+        pushLog(`Browser inspect failed: ${message}`)
+      } finally {
+        setBusy(false)
+      }
+    },
+    [options.output, pushLog],
+  )
+
+  const loadBrowserFilesForInspection = useCallback(
+    async (files: FileList | File[] | null, source: string) => {
+      const fileList = Array.from(files ?? [])
+      if (!fileList.length) return false
+      const videoFile = fileList.find((item) => item.type.startsWith('video/') || isVideoPath(item.name))
+      if (videoFile) {
+        const sourceUrl = URL.createObjectURL(videoFile)
+        if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current)
+        videoObjectUrlRef.current = sourceUrl
+        setVideoOptions((current) => ({
+          ...current,
+          input: videoFile.name,
+          output: current.output || options.output || 'browser-video-output',
+          prefix: current.prefix || videoFile.name.replace(/\.[^.]+$/, '') || 'video_walk',
+        }))
+        setVideoSourceUrl(sourceUrl)
+        setVideoDuration(0)
+        setVideoPreviewGif('')
+        setNotice(`Video set to ${videoFile.name} — adjust grid and click Make Sprite Sheet`)
+        pushLog(`${source}: loaded video ${videoFile.name}.`)
+        return true
+      }
+      const file = fileList.find(isGifFile) ?? fileList.find((item) => item.type.startsWith('image/')) ?? fileList[0]
+      await loadBrowserFileForInspection(file, source)
+      return true
+    },
+    [loadBrowserFileForInspection, options.output, pushLog],
+  )
+
+  const loadLocalPathsForInspection = useCallback(
+    (paths: string[], source: string) => {
+      const path = paths.find(isGifPath) ?? paths[0]
+      if (!path) return false
+      setSourcePath(path)
+      pushLog(`${source}: ${path}`)
+      return true
+    },
+    [pushLog, setSourcePath],
+  )
+
+  const loadDataTransferForInspection = useCallback(
+    async (dataTransfer: DataTransfer, source: string) => {
+      if (await loadBrowserFilesForInspection(dataTransfer.files, source)) return true
+      if (desktopRuntime) return loadLocalPathsForInspection(localPathsFromDataTransfer(dataTransfer), source)
+      return false
+    },
+    [desktopRuntime, loadBrowserFilesForInspection, loadLocalPathsForInspection],
+  )
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -1008,6 +1437,7 @@ function App() {
           }
           const preview = await invoke<string>('preview_image_data_url', { path: event.sheetPath })
           setSheetPreview(preview)
+          setInspectedPreview(null)
           setComparison(null)
           if (event.type === 'pack') {
             const nextReport = remotePackReport(event)
@@ -1052,18 +1482,32 @@ function App() {
       }
       if (event.payload.type === 'drop') {
         setDragging(false)
-        const folder = event.payload.paths[0]
-        if (folder) {
-          setOptions((current) => ({ ...current, input: folder }))
-          setNotice(`Input set to ${fileName(folder)}`)
-          pushLog(`Input folder: ${folder}`)
-        }
+        loadLocalPathsForInspection(event.payload.paths.map(normalizeLocalPath), 'Desktop drop')
       }
     })
     return () => {
       void cleanupDrag.then((unlisten) => unlisten())
     }
-  }, [pushLog])
+  }, [loadLocalPathsForInspection])
+
+  useEffect(() => {
+    const handlePaste = (event: ClipboardEvent) => {
+      if (shouldIgnorePasteTarget(event.target)) return
+      const clipboard = event.clipboardData
+      if (!clipboard) return
+      const hasFiles = clipboard.files.length > 0
+      const paths = desktopRuntime ? localPathsFromDataTransfer(clipboard) : []
+      if (!hasFiles && !paths.length) return
+      event.preventDefault()
+      if (hasFiles) {
+        void loadBrowserFilesForInspection(clipboard.files, 'Paste')
+        return
+      }
+      loadLocalPathsForInspection(paths, 'Paste')
+    }
+    window.addEventListener('paste', handlePaste)
+    return () => window.removeEventListener('paste', handlePaste)
+  }, [desktopRuntime, loadBrowserFilesForInspection, loadLocalPathsForInspection])
 
   useEffect(() => {
     if (!hotReload || !isTauriRuntime() || !options.input || !options.output) return
@@ -1133,25 +1577,73 @@ function App() {
     }
   }
 
-  async function chooseInput() {
-    if (!isTauriRuntime()) {
-      setNotice('Desktop runtime required for folder picking')
+  async function openDesktopPath(options: Parameters<typeof open>[0], label: string): Promise<Awaited<ReturnType<typeof open>> | null> {
+    try {
+      return await open(options)
+    } catch (error) {
+      const message = String(error)
+      setNotice(message)
+      pushLog(`${label} failed: ${message}`)
+      return null
+    }
+  }
+
+  async function saveDesktopPath(options: Parameters<typeof save>[0], label: string): Promise<string | null> {
+    try {
+      return await save(options)
+    } catch (error) {
+      const message = String(error)
+      setNotice(message)
+      pushLog(`${label} failed: ${message}`)
+      return null
+    }
+  }
+
+  async function chooseInputFile() {
+    if (!desktopRuntime) {
+      browserSourceInputRef.current?.click()
       return
     }
-    const selected = await open({ directory: true, multiple: false, defaultPath: options.input || undefined })
+    const selected = await openDesktopPath({
+      directory: false,
+      multiple: false,
+      defaultPath: options.input || undefined,
+      filters: [{ name: 'Images & Video', extensions: ['gif', 'png', 'jpg', 'jpeg', 'webp', 'mp4', 'webm', 'mov', 'm4v'] }],
+    }, 'Input picker')
     if (typeof selected === 'string') {
-      setOptions((current) => ({ ...current, input: selected }))
-      setNotice(`Input set to ${fileName(selected)}`)
-      pushLog(`Input folder: ${selected}`)
+      setSourcePath(selected)
+    }
+  }
+
+  async function chooseInputFolder() {
+    if (!desktopRuntime) {
+      browserSourceInputRef.current?.click()
+      return
+    }
+    const selected = await openDesktopPath({ directory: true, multiple: false, defaultPath: options.input || undefined }, 'Input folder picker')
+    if (typeof selected === 'string') {
+      setSourcePath(selected)
     }
   }
 
   async function chooseOutput() {
-    if (!isTauriRuntime()) {
-      setNotice('Desktop runtime required for folder picking')
+    if (!desktopRuntime) {
+      const directoryPicker = (window as Window & { showDirectoryPicker?: () => Promise<{ name: string }> }).showDirectoryPicker
+      if (directoryPicker) {
+        try {
+          const directory = await directoryPicker()
+          setOptions((current) => ({ ...current, output: directory.name }))
+          setNotice(`Output set to ${directory.name}`)
+          pushLog(`Browser output folder selected: ${directory.name}.`)
+        } catch {
+          setNotice('Output unchanged')
+        }
+      } else {
+        setNotice('Output folders are available in the desktop app')
+      }
       return
     }
-    const selected = await open({ directory: true, multiple: false, defaultPath: options.output || undefined })
+    const selected = await openDesktopPath({ directory: true, multiple: false, defaultPath: options.output || undefined }, 'Output picker')
     if (typeof selected === 'string') {
       setOptions((current) => ({ ...current, output: selected }))
       setNotice(`Output set to ${fileName(selected)}`)
@@ -1160,15 +1652,15 @@ function App() {
   }
 
   async function chooseSheet() {
-    if (!isTauriRuntime()) {
-      setNotice('Desktop runtime required for file picking')
+    if (!desktopRuntime) {
+      browserSheetInputRef.current?.click()
       return
     }
-    const selected = await open({
+    const selected = await openDesktopPath({
       directory: false,
       multiple: false,
       filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif'] }],
-    })
+    }, 'Sheet picker')
     if (typeof selected === 'string') {
       setSliceOptions((current) => ({ ...current, input: selected, output: current.output || options.output }))
       setNotice(`Sheet set to ${fileName(selected)}`)
@@ -1177,38 +1669,82 @@ function App() {
   }
 
   async function chooseVideo() {
-    if (!isTauriRuntime()) {
-      setNotice('Desktop runtime required for video picking')
+    if (!desktopRuntime) {
+      browserVideoInputRef.current?.click()
       return
     }
-    const selected = await open({
+    const selected = await openDesktopPath({
       directory: false,
       multiple: false,
       defaultPath: videoOptions.input || options.input || undefined,
       filters: [{ name: 'Videos', extensions: ['mp4', 'webm', 'mov', 'm4v'] }],
-    })
+    }, 'Video picker')
     if (typeof selected === 'string') {
-      const defaultOutput = videoOptions.output || joinPath(parentPath(selected), 'sprite-output')
-      setVideoOptions((current) => ({ ...current, input: selected, output: current.output || defaultOutput }))
-      setVideoSourceUrl(convertFileSrc(selected))
-      setVideoDuration(0)
-      setVideoPreviewGif('')
-      setNotice(`Video set to ${fileName(selected)}`)
-      pushLog(`Video source: ${selected}`)
+      await loadVideoPath(selected)
     }
   }
 
   async function chooseVideoOutput() {
-    if (!isTauriRuntime()) {
-      setNotice('Desktop runtime required for folder picking')
+    if (!desktopRuntime) {
+      setNotice('Video output folders are available in the desktop app')
       return
     }
-    const selected = await open({ directory: true, multiple: false, defaultPath: videoOptions.output || options.output || undefined })
+    const selected = await openDesktopPath(
+      { directory: true, multiple: false, defaultPath: videoOptions.output || options.output || undefined },
+      'Video output picker',
+    )
     if (typeof selected === 'string') {
       setVideoOptions((current) => ({ ...current, output: selected }))
       setNotice(`Video output set to ${fileName(selected)}`)
       pushLog(`Video output folder: ${selected}`)
     }
+  }
+
+  async function handleBrowserSourceChange(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget
+    const files = input.files
+    await loadBrowserFilesForInspection(files, 'Source picker')
+    input.value = ''
+  }
+
+  async function handleBrowserSheetChange(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget
+    const files = input.files
+    await loadBrowserFilesForInspection(files, 'Sheet picker')
+    input.value = ''
+  }
+
+  function handleBrowserVideoChange(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.currentTarget
+    const file = input.files?.[0]
+    input.value = ''
+    if (!file) return
+    const sourceUrl = URL.createObjectURL(file)
+    if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current)
+    videoObjectUrlRef.current = sourceUrl
+    setVideoOptions((current) => ({
+      ...current,
+      input: file.name,
+      output: current.output || options.output || 'browser-video-output',
+    }))
+    setVideoSourceUrl(sourceUrl)
+    setVideoDuration(0)
+    setVideoPreviewGif('')
+    setNotice(`Video set to ${file.name}`)
+    pushLog(`Browser video source: ${file.name}`)
+  }
+
+  function handleDropZoneDragOver(event: ReactDragEvent<HTMLButtonElement>) {
+    event.preventDefault()
+    setDragging(true)
+    event.dataTransfer.dropEffect = 'copy'
+  }
+
+  async function handleDropZoneDrop(event: ReactDragEvent<HTMLButtonElement>) {
+    event.preventDefault()
+    setDragging(false)
+    const loaded = await loadDataTransferForInspection(event.dataTransfer, 'Drop')
+    if (!loaded) setNotice('Drop a GIF, image, video, or sprite folder')
   }
 
   function setVideoGridPreset(gridPreset: VideoGridPreset) {
@@ -1242,13 +1778,15 @@ function App() {
     setBusy(true)
     setReport(null)
     setSliceReport(null)
+    setInspectedPreview(null)
     setSheetPreview('')
     setComparison(null)
-    setVideoPreviewGif('')
-    setNotice('Loading video...')
+      setVideoPreviewGif('')
+      setNotice('Loading video...')
     try {
       if (!videoSourceUrl) {
-        setVideoSourceUrl(convertFileSrc(videoOptions.input))
+        setNotice('Video preview is still loading')
+        return
       }
       await waitForVideoMetadata(video)
       const duration = Number.isFinite(video.duration) ? video.duration : 0
@@ -1334,6 +1872,10 @@ function App() {
   }
 
   async function runPack(dryRun: boolean) {
+    if (!desktopRuntime) {
+      setNotice('Packing is available in the desktop app')
+      return
+    }
     if (!canRun && !dryRun) {
       setNotice('Choose input and output folders')
       return
@@ -1342,7 +1884,12 @@ function App() {
       setNotice('Choose input and output folders')
       return
     }
+    if (isVideoPath(options.input)) {
+      setNotice('Video files belong in the Video panel — use Make Sprite Sheet')
+      return
+    }
     setBusy(true)
+    setInspectedPreview(null)
     setSheetPreview('')
     setNotice(dryRun ? 'Planning atlas...' : 'Packing atlas...')
     try {
@@ -1371,6 +1918,7 @@ function App() {
 
   async function runHotReloadPack(signature: string) {
     setBusy(true)
+    setInspectedPreview(null)
     setSheetPreview('')
     setNotice('Hot-reloading atlas...')
     try {
@@ -1397,12 +1945,17 @@ function App() {
   }
 
   async function runSlice(dryRun: boolean) {
+    if (!desktopRuntime) {
+      setNotice('Slicing is available in the desktop app')
+      return
+    }
     const output = sliceOptions.output || options.output
     if (!sliceOptions.input || (!output && !dryRun)) {
       setNotice('Choose a sheet image and output folder')
       return
     }
     setBusy(true)
+    setInspectedPreview(null)
     setSheetPreview('')
     setNotice(dryRun ? 'Planning sheet slice...' : 'Slicing sheet...')
     try {
@@ -1446,16 +1999,17 @@ function App() {
       setNotice('Desktop runtime required for project files')
       return
     }
-    const selected = await open({
+    const selected = await openDesktopPath({
       directory: false,
       multiple: false,
       filters: [{ name: 'Atlas Project', extensions: ['atlasproj.json', 'json'] }],
-    })
+    }, 'Project picker')
     if (typeof selected !== 'string') return
     try {
       const project = await invoke<ProjectOptions>('load_project_gui', { path: selected })
       setOptions({ ...project, dryRun: false })
       setReport(null)
+      setInspectedPreview(null)
       setSheetPreview('')
       setNotice(`Loaded ${fileName(selected)}`)
       pushLog(`Loaded project: ${selected}`)
@@ -1471,10 +2025,10 @@ function App() {
       setNotice('Desktop runtime required for project files')
       return
     }
-    const selected = await save({
+    const selected = await saveDesktopPath({
       defaultPath: 'atlas.atlasproj.json',
       filters: [{ name: 'Atlas Project', extensions: ['json'] }],
-    })
+    }, 'Project save picker')
     if (typeof selected !== 'string') return
     try {
       const { dryRun: _dryRun, ...projectOptions } = options
@@ -1493,11 +2047,11 @@ function App() {
       setNotice('Desktop runtime required for comparison atlases')
       return
     }
-    const selected = await open({
+    const selected = await openDesktopPath({
       directory: false,
       multiple: false,
       filters: [{ name: 'Atlas JSON', extensions: ['json'] }],
-    })
+    }, 'Comparison picker')
     if (typeof selected !== 'string') return
     try {
       const loaded = await invoke<AtlasPreviewLoad>('load_atlas_preview_gui', { path: selected })
@@ -1522,10 +2076,10 @@ function App() {
       setNotice('Pack or slice an atlas before exporting')
       return
     }
-    const selected = await save({
+    const selected = await saveDesktopPath({
       defaultPath: `${animation || 'animation'}.gif`,
       filters: [{ name: 'GIF', extensions: ['gif'] }],
-    })
+    }, 'GIF export picker')
     if (typeof selected !== 'string') return
     try {
       const result = await invoke<GifExportReport>('export_gif_gui', {
@@ -1549,17 +2103,17 @@ function App() {
   }
 
   async function exportWebm(animation: string, fpsOverride: number, frameStart: number, frameEnd: number) {
-    const atlas = report?.atlas ?? sliceReport?.atlas
+    const atlas = inspectedPreview?.atlas ?? report?.atlas ?? sliceReport?.atlas
     if (!atlas || !sheetPreview) {
-      setNotice('Pack or slice an atlas before exporting')
+      setNotice('Load an animation preview before exporting')
       return
     }
     let selected = ''
     if (isTauriRuntime()) {
-      const saved = await save({
+      const saved = await saveDesktopPath({
         defaultPath: `${animation || 'animation'}.webm`,
         filters: [{ name: 'WebM', extensions: ['webm'] }],
-      })
+      }, 'WebM export picker')
       if (typeof saved !== 'string') return
       selected = saved
     }
@@ -1582,9 +2136,19 @@ function App() {
     }
   }
 
+  function reorderInspectedPreviewFrames(animation: string, fromIndex: number, toIndex: number) {
+    setInspectedPreview((current) => {
+      if (!current) return current
+      return { ...current, atlas: reorderAtlasAnimation(current.atlas, animation, fromIndex, toIndex) }
+    })
+    setNotice(`Moved frame ${fromIndex + 1} to ${toIndex + 1}`)
+    pushLog(`Reordered ${animation}: frame ${fromIndex + 1} to ${toIndex + 1}.`)
+  }
+
   function reset() {
     setReport(null)
     setSliceReport(null)
+    setInspectedPreview(null)
     setSheetPreview('')
     setComparison(null)
     setVideoPreviewGif('')
@@ -1592,13 +2156,37 @@ function App() {
     setNotice('Ready')
   }
 
-  const displayedAnimations = report?.animations ?? sliceReport?.atlas.animations?.map((animation) => animation.name) ?? []
-  const displayedWrote = report?.wrote.join(', ') || sliceReport?.wrote.join(', ') || 'None'
-  const displayedAtlas = report?.atlas ?? sliceReport?.atlas
-  const displayedPreview = sheetPreview
+  const displayedAnimations =
+    inspectedPreview?.atlas.animations?.map((animation) => animation.name) ??
+    report?.animations ??
+    sliceReport?.atlas.animations?.map((animation) => animation.name) ??
+    []
+  const displayedWrote = inspectedPreview ? 'Inspect only' : report?.wrote.join(', ') || sliceReport?.wrote.join(', ') || 'None'
 
   return (
     <div className="app-shell theme-neko-tron">
+      <input
+        accept=".gif,.png,.jpg,.jpeg,.webp,image/gif,image/png,image/jpeg,image/webp"
+        className="browser-file-input"
+        multiple
+        ref={browserSourceInputRef}
+        type="file"
+        onChange={(event) => void handleBrowserSourceChange(event)}
+      />
+      <input
+        accept=".gif,.png,.jpg,.jpeg,.webp,image/gif,image/png,image/jpeg,image/webp"
+        className="browser-file-input"
+        ref={browserSheetInputRef}
+        type="file"
+        onChange={(event) => void handleBrowserSheetChange(event)}
+      />
+      <input
+        accept=".mp4,.webm,.mov,.m4v,video/mp4,video/webm,video/quicktime"
+        className="browser-file-input"
+        ref={browserVideoInputRef}
+        type="file"
+        onChange={(event) => handleBrowserVideoChange(event)}
+      />
       <header className="topbar">
         <div className="brand-lockup">
           <div>
@@ -1610,9 +2198,12 @@ function App() {
           </div>
         </div>
         <div className="topbar-actions">
-          <button className="secondary-action" type="button" onClick={chooseInput} title="Choose input folder">
-            <FolderOpen size={17} />
+          <button className="secondary-action" type="button" onClick={chooseInputFile} title="Choose GIF or image">
+            <ImageIcon size={17} />
             Input
+          </button>
+          <button className="icon-button" type="button" onClick={chooseInputFolder} title="Choose input folder">
+            <FolderOpen size={17} />
           </button>
           <button className="secondary-action" type="button" onClick={chooseOutput} title="Choose output folder">
             <FolderOpen size={17} />
@@ -1646,7 +2237,10 @@ function App() {
             </div>
             <div className="folder-row">
               <input value={compactPath(options.input)} readOnly />
-              <button className="icon-button compact" type="button" onClick={chooseInput} title="Choose input folder">
+              <button className="icon-button compact" type="button" onClick={chooseInputFile} title="Choose GIF or image">
+                <ImageIcon size={15} />
+              </button>
+              <button className="icon-button compact" type="button" onClick={chooseInputFolder} title="Choose input folder">
                 <FolderOpen size={15} />
               </button>
             </div>
@@ -1841,7 +2435,7 @@ function App() {
                 }
               />
             </label>
-            <button className="secondary-action full" type="button" onClick={() => void runPack(true)} disabled={!options.input || busy}>
+            <button className="secondary-action full" type="button" onClick={() => void runPack(true)} disabled={!desktopRuntime || !options.input || busy}>
               <Play size={16} />
               Dry Run
             </button>
@@ -2034,7 +2628,7 @@ function App() {
             <div className="video-range-note">
               {videoDuration > 0 ? `${videoRangeSeconds.toFixed(2)}s sampled from ${videoDuration.toFixed(2)}s` : 'Duration loads after video selection'}
             </div>
-            <button className="secondary-action full" type="button" onClick={() => void runVideoToSpriteSheet()} disabled={!videoOptions.input || busy}>
+            <button className="secondary-action full" type="button" onClick={() => void runVideoToSpriteSheet()} disabled={!desktopRuntime || !videoOptions.input || busy}>
               {busy ? <Loader2 className="spin" size={16} /> : <Grid3X3 size={16} />}
               Make Sprite Sheet
             </button>
@@ -2131,7 +2725,7 @@ function App() {
               />
               <span>Aseprite JSON</span>
             </label>
-            <button className="secondary-action full" type="button" onClick={() => void runSlice(false)} disabled={!sliceOptions.input || busy}>
+            <button className="secondary-action full" type="button" onClick={() => void runSlice(false)} disabled={!desktopRuntime || !sliceOptions.input || busy}>
               <Layers size={16} />
               Slice Sheet
             </button>
@@ -2158,13 +2752,21 @@ function App() {
             </div>
           </div>
 
-          <button className={classNames('drop-zone', dragging && 'dragging')} type="button" onClick={chooseInput}>
+          <button
+            className={classNames('drop-zone', dragging && 'dragging')}
+            type="button"
+            onClick={chooseInputFile}
+            onDragEnter={handleDropZoneDragOver}
+            onDragLeave={() => setDragging(false)}
+            onDragOver={handleDropZoneDragOver}
+            onDrop={(event) => void handleDropZoneDrop(event)}
+          >
             <div className="drop-glyph">
               <BoxSelect size={28} />
             </div>
             <div>
-              <h2>{options.input ? fileName(options.input) : 'Drop Sprite Folder'}</h2>
-              <p>{options.input ? compactPath(options.input) : 'PNG, JPG, WebP, GIF, Aseprite'}</p>
+              <h2>{options.input ? fileName(options.input) : desktopRuntime ? 'Drop Sprite Folder, GIF, or Video' : 'Drop GIF or Image'}</h2>
+              <p>{options.input ? compactPath(options.input) : 'PNG, JPG, WebP, GIF, Aseprite, MP4, WebM'}</p>
             </div>
           </button>
 
@@ -2173,8 +2775,11 @@ function App() {
               <AtlasPreview
                 atlas={displayedAtlas}
                 sheetSrc={displayedPreview}
-                onExportGif={(animation, fps, frameStart, frameEnd) => void exportGif(animation, fps, frameStart, frameEnd)}
+                onExportGif={
+                  inspectedPreview ? undefined : (animation, fps, frameStart, frameEnd) => void exportGif(animation, fps, frameStart, frameEnd)
+                }
                 onExportWebm={(animation, fps, frameStart, frameEnd) => void exportWebm(animation, fps, frameStart, frameEnd)}
+                onReorderFrames={inspectedPreview ? reorderInspectedPreviewFrames : undefined}
               />
             ) : (
               <section className="preview-panel animator-panel">

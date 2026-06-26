@@ -1,7 +1,7 @@
 {
   "name": "sprite-atlas-packer",
   "private": true,
-  "version": "26.6.19",
+  "version": "26.6.25",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -11,12 +11,14 @@
     "preview": "vite preview --host 127.0.0.1 --port 1451",
     "tauri": "tauri",
     "tauri:dev": "tauri dev --features desktop",
-    "tauri:build": "tauri build --features desktop"
+    "tauri:build": "tauri build --features desktop",
+    "build:portable": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-portable.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.0",
     "@tauri-apps/plugin-dialog": "2.7.1",
     "@tauri-apps/plugin-opener": "2.5.4",
+    "gifuct-js": "^2.1.2",
     "lucide-react": "0.468.0",
     "react": "18.3.1",
     "react-dom": "18.3.1"
