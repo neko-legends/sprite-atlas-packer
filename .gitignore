@@ -49,3 +49,4 @@ demo-cat-walk/*
 !demo-cat-walk/video-tool-output/
 demo-cat-walk/video-tool-output/*
 !demo-cat-walk/video-tool-output/cat_walk_video_preview_slow_7fps.gif
+!demo-cat-walk/video-tool-output/sprite-atlas-packer-cat-walk-inspect.png

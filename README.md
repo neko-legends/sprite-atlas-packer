@@ -12,6 +12,8 @@ named `aseprite` on your PATH.
 
 ![Video to packed sprite animation preview](demo-cat-walk/video-tool-output/cat_walk_video_preview_slow_7fps.gif)
 
+![Sprite Atlas Packer GUI inspecting the cat walk GIF](demo-cat-walk/video-tool-output/sprite-atlas-packer-cat-walk-inspect.png)
+
 ```bash
 cargo run --manifest-path src-tauri/Cargo.toml -- \
   --headless \
