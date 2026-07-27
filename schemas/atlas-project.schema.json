@@ -22,6 +22,14 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
+    "pixelSnap": { "type": "boolean" },
+    "pixelSnapSize": { "type": ["number", "null"], "minimum": 1 },
+    "pixelSnapColors": { "type": "integer", "minimum": 2, "maximum": 256 },
+    "pixelSnapPalette": {
+      "type": "string",
+      "pattern": "^\\s*(#?[0-9A-Fa-f]{6})(\\s*,\\s*#?[0-9A-Fa-f]{6})*\\s*$|^$"
+    },
+    "pixelSnapLockGrid": { "type": "boolean" },
     "packingStrategy": { "enum": ["maxrects", "guillotine", "quadtree", "shelf"] },
     "animations": {
       "type": "array",

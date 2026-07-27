@@ -14,6 +14,31 @@ named `aseprite` on your PATH.
 
 ![Sprite Atlas Packer GUI inspecting the cat walk GIF](demo-cat-walk/video-tool-output/sprite-atlas-packer-cat-walk-inspect.png)
 
+## Pixel Art Finish
+
+The desktop app now includes an optional final-stage **Pixel Art Finish** panel
+for AI-generated or otherwise inconsistent pixel art. It runs before trimming
+and packing:
+
+- palette quantization reduces color drift;
+- edge profiles reveal the implied horizontal and vertical pixel grid;
+- an elastic grid walker follows imperfect block boundaries;
+- each detected cell becomes one logical pixel using its dominant color;
+- an optional custom hex palette constrains the final colors; and
+- auto-detected animation frames use one shared median grid by default so the
+  sprite does not change scale between frames.
+
+Leave **Grid Pixel Size** blank to detect it, or enter the known source block
+size for the most predictable final sheet. The output is logical 1× pixel art,
+ready for nearest-neighbor scaling in the game engine. Pixel Art Finish is
+opt-in. Linked channel textures reuse each color sprite's exact detected grid
+and trim bounds without palette quantization, preserving normal-map, emissive,
+and mask values in their matching atlas sheets.
+
+The implementation adapts MIT-licensed techniques from
+[Sprite Fusion Pixel Snapper](https://github.com/Hugo-Dz/spritefusion-pixel-snapper);
+see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ```bash
 cargo run --manifest-path src-tauri/Cargo.toml -- \
   --headless \
@@ -49,6 +74,11 @@ Project files can pin a batch:
   "stablePivot": true,
   "dedupThreshold": 1,
   "linkedChannels": ["_n", "_e", "_m"],
+  "pixelSnap": false,
+  "pixelSnapColors": 16,
+  "pixelSnapSize": null,
+  "pixelSnapPalette": "",
+  "pixelSnapLockGrid": true,
   "godotSpriteframes": true,
   "unityImporter": true,
   "packingStrategy": "maxrects",

@@ -50,6 +50,11 @@ type PackOptions = {
   stablePivot: boolean
   dedupThreshold?: number | null
   linkedChannels: string[]
+  pixelSnap: boolean
+  pixelSnapSize?: number | null
+  pixelSnapColors: number
+  pixelSnapPalette: string
+  pixelSnapLockGrid: boolean
 }
 
 type ProjectOptions = Omit<PackOptions, 'dryRun'>
@@ -235,6 +240,11 @@ const defaultOptions: PackOptions = {
   stablePivot: false,
   dedupThreshold: null,
   linkedChannels: [],
+  pixelSnap: false,
+  pixelSnapSize: null,
+  pixelSnapColors: 16,
+  pixelSnapPalette: '',
+  pixelSnapLockGrid: true,
 }
 
 const defaultVideoOptions: VideoOptions = {
@@ -322,6 +332,17 @@ function loadOptions(): PackOptions {
       linkedChannels: Array.isArray(parsed.linkedChannels)
         ? parsed.linkedChannels.filter((item): item is string => typeof item === 'string')
         : [],
+      pixelSnap: typeof parsed.pixelSnap === 'boolean' ? parsed.pixelSnap : false,
+      pixelSnapSize:
+        typeof parsed.pixelSnapSize === 'number' && Number.isFinite(parsed.pixelSnapSize)
+          ? Math.max(1, parsed.pixelSnapSize)
+          : null,
+      pixelSnapColors:
+        typeof parsed.pixelSnapColors === 'number' && Number.isFinite(parsed.pixelSnapColors)
+          ? Math.max(2, Math.min(256, Math.round(parsed.pixelSnapColors)))
+          : 16,
+      pixelSnapPalette: typeof parsed.pixelSnapPalette === 'string' ? parsed.pixelSnapPalette : '',
+      pixelSnapLockGrid: typeof parsed.pixelSnapLockGrid === 'boolean' ? parsed.pixelSnapLockGrid : true,
     }
   } catch {
     return defaultOptions
@@ -2588,6 +2609,104 @@ function App() {
                 }
               />
             </label>
+          </section>
+
+          <section className={classNames('panel-section', options.pixelSnap && 'pixel-finish-active')}>
+            <div className="section-title">
+              <Sparkles size={16} />
+              Pixel Art Finish
+              <span className="finish-stage-badge">FINAL STAGE</span>
+            </div>
+            <label className="toggle-row">
+              <input
+                type="checkbox"
+                checked={options.pixelSnap}
+                onChange={(event) => {
+                  const pixelSnap = event.currentTarget.checked
+                  setOptions((current) => ({ ...current, pixelSnap }))
+                }}
+              />
+              <span>Snap artwork to a clean pixel grid</span>
+            </label>
+            <p className="panel-help">
+              Detects the implied grid, chooses one color per cell, and quantizes the palette before packing.
+            </p>
+            <div className="pixel-finish-grid">
+              <label className="field">
+                <span>Grid Pixel Size</span>
+                <input
+                  min={1}
+                  placeholder="Auto detect"
+                  step={0.5}
+                  type="number"
+                  value={options.pixelSnapSize ?? ''}
+                  onChange={(event) => {
+                    const value = event.currentTarget.value
+                    setOptions((current) => ({
+                      ...current,
+                      pixelSnapSize:
+                        value === ''
+                          ? null
+                          : Math.max(1, Number(value) || 1),
+                    }))
+                  }}
+                  disabled={!options.pixelSnap}
+                />
+              </label>
+              <label className="field">
+                <span>Palette Colors</span>
+                <input
+                  min={2}
+                  max={256}
+                  type="number"
+                  value={options.pixelSnapColors}
+                  onChange={(event) => {
+                    const value = event.currentTarget.value
+                    setOptions((current) => ({
+                      ...current,
+                      pixelSnapColors: Math.max(
+                        2,
+                        Math.min(256, Math.round(Number(value) || 2)),
+                      ),
+                    }))
+                  }}
+                  disabled={!options.pixelSnap}
+                />
+              </label>
+            </div>
+            <label className="toggle-row" title="Use the median detected grid for every animation frame">
+              <input
+                type="checkbox"
+                checked={options.pixelSnapLockGrid}
+                onChange={(event) => {
+                  const pixelSnapLockGrid = event.currentTarget.checked
+                  setOptions((current) => ({
+                    ...current,
+                    pixelSnapLockGrid,
+                  }))
+                }}
+                disabled={!options.pixelSnap || options.pixelSnapSize != null}
+              />
+              <span>Lock one grid across animation frames</span>
+            </label>
+            <label className="field">
+              <span>Custom Palette (optional)</span>
+              <input
+                placeholder="0d2b45,203c56,ffaa5e,ffecd6"
+                value={options.pixelSnapPalette}
+                onChange={(event) => {
+                  const pixelSnapPalette = event.currentTarget.value
+                  setOptions((current) => ({
+                    ...current,
+                    pixelSnapPalette,
+                  }))
+                }}
+                disabled={!options.pixelSnap}
+              />
+            </label>
+            <p className="panel-help compact-help">
+              Output becomes logical 1× pixels. Leave grid size blank for detection; set it when the source block size is known.
+            </p>
           </section>
 
           <section className="panel-section">

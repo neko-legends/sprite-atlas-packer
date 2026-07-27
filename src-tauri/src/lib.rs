@@ -34,6 +34,9 @@ use tauri_plugin_opener::OpenerExt;
 use thiserror::Error;
 use walkdir::WalkDir;
 
+mod pixel_snap;
+use pixel_snap::{PixelGrid, PixelSnapOptions};
+
 const APP_NAME: &str = "sprite-atlas-packer";
 const VERSION: &str = "26.6.25";
 const DEFAULT_DURATION_MS: u32 = 120;
@@ -235,6 +238,16 @@ struct ProjectFile {
     dedup_threshold: Option<u8>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     linked_channels: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pixel_snap: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pixel_snap_size: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pixel_snap_colors: Option<usize>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pixel_snap_palette: String,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pixel_snap_lock_grid: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     animations: Vec<AnimationDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -310,6 +323,18 @@ fn default_frame_prefix() -> String {
 
 fn default_generated_frame_size() -> u32 {
     256
+}
+
+fn default_pixel_snap_colors() -> usize {
+    16
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 fn default_walk_frame_count() -> u32 {
@@ -473,6 +498,16 @@ pub struct GuiPackOptions {
     pub dedup_threshold: Option<u8>,
     #[serde(default)]
     pub linked_channels: Vec<String>,
+    #[serde(default)]
+    pub pixel_snap: bool,
+    #[serde(default)]
+    pub pixel_snap_size: Option<f64>,
+    #[serde(default = "default_pixel_snap_colors")]
+    pub pixel_snap_colors: usize,
+    #[serde(default)]
+    pub pixel_snap_palette: String,
+    #[serde(default = "default_true")]
+    pub pixel_snap_lock_grid: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -503,6 +538,16 @@ pub struct GuiProjectOptions {
     pub dedup_threshold: Option<u8>,
     #[serde(default)]
     pub linked_channels: Vec<String>,
+    #[serde(default)]
+    pub pixel_snap: bool,
+    #[serde(default)]
+    pub pixel_snap_size: Option<f64>,
+    #[serde(default = "default_pixel_snap_colors")]
+    pub pixel_snap_colors: usize,
+    #[serde(default)]
+    pub pixel_snap_palette: String,
+    #[serde(default = "default_true")]
+    pub pixel_snap_lock_grid: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1033,35 +1078,39 @@ pub fn run() {
 #[cfg(feature = "desktop")]
 #[tauri::command]
 fn pack_atlas_gui(options: GuiPackOptions) -> std::result::Result<PackReport, String> {
+    let pixel_snap_options = pixel_snap_options_from_gui(&options);
     let format = OutputFormat::parse(&options.format).map_err(|error| error.to_string())?;
     let packing_strategy =
         PackingStrategy::parse(&options.packing_strategy).map_err(|error| error.to_string())?;
-    pack(PackOptions {
-        input: PathBuf::from(options.input),
-        output: PathBuf::from(options.output),
-        format,
-        packing_strategy,
-        pot: options.pot,
-        padding: options.padding,
-        max_size: options.max_size,
-        rotate: options.rotate,
-        trim: options.trim,
-        dry_run: options.dry_run,
-        watch: false,
-        slice_mode: None,
-        cell: None,
-        prefix: "frame".to_string(),
-        aseprite_json: options.aseprite_json,
-        godot_spriteframes: options.godot_spriteframes,
-        unity_importer: options.unity_importer,
-        animation_regex: clean_optional_string(options.animation_regex),
-        animations: Vec::new(),
-        stable_pivot: options.stable_pivot,
-        dedup_threshold: options.dedup_threshold,
-        linked_channels: normalize_channel_suffixes(options.linked_channels),
-        normalize_generated: false,
-        frame_size: None,
-    })
+    pack_with_pixel_snap(
+        PackOptions {
+            input: PathBuf::from(options.input),
+            output: PathBuf::from(options.output),
+            format,
+            packing_strategy,
+            pot: options.pot,
+            padding: options.padding,
+            max_size: options.max_size,
+            rotate: options.rotate,
+            trim: options.trim,
+            dry_run: options.dry_run,
+            watch: false,
+            slice_mode: None,
+            cell: None,
+            prefix: "frame".to_string(),
+            aseprite_json: options.aseprite_json,
+            godot_spriteframes: options.godot_spriteframes,
+            unity_importer: options.unity_importer,
+            animation_regex: clean_optional_string(options.animation_regex),
+            animations: Vec::new(),
+            stable_pivot: options.stable_pivot,
+            dedup_threshold: options.dedup_threshold,
+            linked_channels: normalize_channel_suffixes(options.linked_channels),
+            normalize_generated: false,
+            frame_size: None,
+        },
+        pixel_snap_options,
+    )
     .map_err(|error| error.to_string())
 }
 
@@ -1128,6 +1177,11 @@ fn load_project_gui(path: String) -> std::result::Result<GuiProjectOptions, Stri
 #[cfg(feature = "desktop")]
 #[tauri::command]
 fn save_project_gui(path: String, options: GuiProjectOptions) -> std::result::Result<(), String> {
+    let pixel_snap = options.pixel_snap;
+    let pixel_snap_size = options.pixel_snap_size;
+    let pixel_snap_colors = options.pixel_snap_colors;
+    let pixel_snap_palette = options.pixel_snap_palette.clone();
+    let pixel_snap_lock_grid = options.pixel_snap_lock_grid;
     let pack_options = PackOptions {
         input: PathBuf::from(options.input),
         output: PathBuf::from(options.output),
@@ -1155,7 +1209,20 @@ fn save_project_gui(path: String, options: GuiProjectOptions) -> std::result::Re
         normalize_generated: false,
         frame_size: None,
     };
-    write_project_file(Path::new(&path), &pack_options).map_err(|error| error.to_string())
+    let path = Path::new(&path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+    }
+    let mut project = project_from_options(&pack_options);
+    project.pixel_snap = pixel_snap;
+    project.pixel_snap_size = pixel_snap_size;
+    project.pixel_snap_colors = Some(pixel_snap_colors);
+    project.pixel_snap_palette = pixel_snap_palette;
+    project.pixel_snap_lock_grid = pixel_snap_lock_grid;
+    let json = serde_json::to_string_pretty(&project).map_err(|error| error.to_string())?;
+    write_text_if_changed(path, &format!("{json}\n")).map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "desktop")]
@@ -1333,9 +1400,23 @@ fn stop_agent_control_gui(
 }
 
 pub fn pack(options: PackOptions) -> Result<PackReport> {
+    pack_with_pixel_snap(options, PixelSnapOptions::default())
+}
+
+fn pack_with_pixel_snap(
+    options: PackOptions,
+    pixel_snap_options: PixelSnapOptions,
+) -> Result<PackReport> {
     validate_options(&options)?;
-    let sources =
-        load_sources_with_channels(&options.input, options.trim, &options.linked_channels)?;
+    let (sources, pixel_grids) = if pixel_snap_options.enabled {
+        let sources = load_sources_with_channels(&options.input, false, &options.linked_channels)?;
+        pixel_snap_sources(sources, options.trim, &pixel_snap_options)?
+    } else {
+        (
+            load_sources_with_channels(&options.input, options.trim, &options.linked_channels)?,
+            BTreeMap::new(),
+        )
+    };
     validate_animation_options(&options, &sources)?;
     if sources.is_empty() {
         return Err(AtlasError::Message(format!(
@@ -1349,6 +1430,7 @@ pub fn pack(options: PackOptions) -> Result<PackReport> {
         options.dedup_threshold,
         options.trim,
         &options.linked_channels,
+        &pixel_grids,
     )?;
     let alias_reports = aliases
         .iter()
@@ -1432,6 +1514,7 @@ pub fn pack(options: PackOptions) -> Result<PackReport> {
                 layout.height,
                 suffix,
                 options.trim,
+                &pixel_grids,
             )?;
             for name in
                 write_channel_sheet(&options.output, options.format, suffix, &channel_sheet)?
@@ -3037,10 +3120,11 @@ fn handle_control_connection(
         }
         ("POST", "/api/v1/pack") => {
             let gui: GuiPackOptions = serde_json::from_slice(&request.body)?;
+            let pixel_snap_options = pixel_snap_options_from_gui(&gui);
             let options = pack_options_from_gui(gui)?;
             let sheet_path = options.output.join(options.format.atlas_image_name());
             let output = options.output.clone();
-            let report = pack(options)?;
+            let report = pack_with_pixel_snap(options, pixel_snap_options)?;
             let sheet_path = sheet_path.to_string_lossy().to_string();
             let output = output.to_string_lossy().to_string();
             {
@@ -3259,6 +3343,16 @@ fn pack_options_from_gui(options: GuiPackOptions) -> Result<PackOptions> {
         normalize_generated: false,
         frame_size: None,
     })
+}
+
+fn pixel_snap_options_from_gui(options: &GuiPackOptions) -> PixelSnapOptions {
+    PixelSnapOptions {
+        enabled: options.pixel_snap,
+        color_count: options.pixel_snap_colors,
+        pixel_size: options.pixel_snap_size,
+        palette: options.pixel_snap_palette.clone(),
+        lock_grid: options.pixel_snap_lock_grid,
+    }
 }
 
 fn slice_options_from_gui(options: GuiSliceOptions) -> Result<PackOptions> {
@@ -3608,6 +3702,13 @@ fn project_to_gui_options(project: ProjectFile, base: &Path) -> GuiProjectOption
         stable_pivot: project.stable_pivot.unwrap_or(false),
         dedup_threshold: project.dedup_threshold,
         linked_channels: normalize_channel_suffixes(project.linked_channels),
+        pixel_snap: project.pixel_snap,
+        pixel_snap_size: project.pixel_snap_size,
+        pixel_snap_colors: project
+            .pixel_snap_colors
+            .unwrap_or_else(default_pixel_snap_colors),
+        pixel_snap_palette: project.pixel_snap_palette,
+        pixel_snap_lock_grid: project.pixel_snap_lock_grid,
     }
 }
 
@@ -3628,6 +3729,11 @@ fn project_from_options(options: &PackOptions) -> ProjectFile {
         stable_pivot: Some(options.stable_pivot),
         dedup_threshold: options.dedup_threshold,
         linked_channels: normalize_channel_suffixes(options.linked_channels.clone()),
+        pixel_snap: false,
+        pixel_snap_size: None,
+        pixel_snap_colors: None,
+        pixel_snap_palette: String::new(),
+        pixel_snap_lock_grid: true,
         animations: options.animations.clone(),
         packing_strategy: Some(options.packing_strategy.as_str().to_string()),
     }
@@ -5908,6 +6014,43 @@ fn load_sources(input: &Path, trim: bool) -> Result<Vec<SourceSprite>> {
     validate_unique_frame_names(sources)
 }
 
+fn pixel_snap_sources(
+    sources: Vec<SourceSprite>,
+    trim: bool,
+    options: &PixelSnapOptions,
+) -> Result<(Vec<SourceSprite>, BTreeMap<PathBuf, PixelGrid>)> {
+    let images = sources
+        .iter()
+        .map(|source| source.image.clone())
+        .collect::<Vec<_>>();
+    let snapped =
+        pixel_snap::snap_images_with_grids(&images, options).map_err(AtlasError::Message)?;
+    let mut grids = BTreeMap::new();
+    let sources = sources
+        .into_iter()
+        .zip(snapped)
+        .map(|(mut source, snapped)| {
+            grids.insert(source.path.clone(), snapped.grid);
+            let image = snapped.image;
+            let original_width = image.width();
+            let original_height = image.height();
+            let (image, trim_x, trim_y, trimmed) = if trim {
+                trim_image(&image)
+            } else {
+                (image, 0, 0, false)
+            };
+            source.image = image;
+            source.original_width = original_width;
+            source.original_height = original_height;
+            source.trim_x = trim_x;
+            source.trim_y = trim_y;
+            source.trimmed = trimmed;
+            source
+        })
+        .collect();
+    Ok((sources, grids))
+}
+
 fn load_sources_with_channels(
     input: &Path,
     trim: bool,
@@ -6920,17 +7063,23 @@ fn render_linked_channel_sheet(
     height: u32,
     suffix: &str,
     trim: bool,
+    pixel_grids: &BTreeMap<PathBuf, PixelGrid>,
 ) -> Result<RgbaImage> {
     let mut sheet = RgbaImage::from_pixel(width, height, Rgba([0, 0, 0, 0]));
     for sprite in sprites {
-        let channel = load_linked_channel_image(&sprite.source, suffix, trim)?;
+        let channel = load_linked_channel_image(&sprite.source, suffix, trim, pixel_grids)?;
         let channel = packed_sprite_image(&channel, sprite.rotated);
         image::imageops::overlay(&mut sheet, &channel, sprite.x.into(), sprite.y.into());
     }
     Ok(sheet)
 }
 
-fn load_linked_channel_image(source: &SourceSprite, suffix: &str, trim: bool) -> Result<RgbaImage> {
+fn load_linked_channel_image(
+    source: &SourceSprite,
+    suffix: &str,
+    trim: bool,
+    pixel_grids: &BTreeMap<PathBuf, PixelGrid>,
+) -> Result<RgbaImage> {
     let Some(path) = linked_channel_path(source, suffix) else {
         return Ok(RgbaImage::from_pixel(
             source.image.width(),
@@ -6938,7 +7087,17 @@ fn load_linked_channel_image(source: &SourceSprite, suffix: &str, trim: bool) ->
             Rgba([0, 0, 0, 0]),
         ));
     };
-    let image = decode_image(&path)?;
+    let input = decode_image(&path)?;
+    let image = if let Some(grid) = pixel_grids.get(&source.path) {
+        pixel_snap::resample_linked_channel(&input, grid).map_err(|error| {
+            AtlasError::Message(format!(
+                "Unable to apply the color sprite's Pixel Snap grid to {}: {error}",
+                path.display()
+            ))
+        })?
+    } else {
+        input
+    };
     if image.width() != source.original_width || image.height() != source.original_height {
         return Err(AtlasError::Message(format!(
             "Linked channel {} must match {} dimensions ({}x{}), got {}x{}",
@@ -6969,6 +7128,7 @@ fn deduplicate_sources(
     threshold: Option<u8>,
     trim: bool,
     linked_channels: &[String],
+    pixel_grids: &BTreeMap<PathBuf, PixelGrid>,
 ) -> Result<(Vec<SourceSprite>, Vec<SourceAlias>)> {
     let Some(threshold) = threshold else {
         return Ok((sources.to_vec(), Vec::new()));
@@ -6978,8 +7138,14 @@ fn deduplicate_sources(
     for source in sources {
         let mut target = None;
         for candidate in &unique {
-            if can_alias_source_with_channels(source, candidate, threshold, trim, linked_channels)?
-            {
+            if can_alias_source_with_channels(
+                source,
+                candidate,
+                threshold,
+                trim,
+                linked_channels,
+                pixel_grids,
+            )? {
                 target = Some(candidate.name.clone());
                 break;
             }
@@ -7002,13 +7168,14 @@ fn can_alias_source_with_channels(
     threshold: u8,
     trim: bool,
     linked_channels: &[String],
+    pixel_grids: &BTreeMap<PathBuf, PixelGrid>,
 ) -> Result<bool> {
     if !can_alias_source(source, candidate, threshold) {
         return Ok(false);
     }
     for suffix in linked_channels {
-        let source_channel = load_linked_channel_image(source, suffix, trim)?;
-        let candidate_channel = load_linked_channel_image(candidate, suffix, trim)?;
+        let source_channel = load_linked_channel_image(source, suffix, trim, pixel_grids)?;
+        let candidate_channel = load_linked_channel_image(candidate, suffix, trim, pixel_grids)?;
         if !image_delta_within_threshold(&source_channel, &candidate_channel, threshold) {
             return Ok(false);
         }
@@ -7363,6 +7530,109 @@ mod tests {
     use super::*;
     use image::Rgba;
     use tempfile::TempDir;
+
+    #[test]
+    fn pixel_art_finish_runs_before_atlas_packing() {
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("input");
+        let output = temp.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        write_precise_sprite(
+            &input.join("hero_idle_0.png"),
+            8,
+            8,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+            },
+            [240, 20, 30, 255],
+        );
+
+        let report = pack_with_pixel_snap(
+            PackOptions {
+                input,
+                output: output.clone(),
+                format: OutputFormat::Png,
+                pot: false,
+                padding: 0,
+                trim: false,
+                ..PackOptions::default()
+            },
+            PixelSnapOptions {
+                enabled: true,
+                color_count: 4,
+                pixel_size: Some(4.0),
+                palette: "000000,ffffff".to_string(),
+                lock_grid: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.atlas.frames[0].source_size, Size { w: 2, h: 2 });
+        assert_eq!(report.atlas_width, 2);
+        assert_eq!(report.atlas_height, 2);
+        let sheet = image::open(output.join("sheet.png")).unwrap().to_rgba8();
+        assert_eq!(sheet.get_pixel(0, 0).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn pixel_art_finish_reuses_color_grid_for_linked_channels() {
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("input");
+        let output = temp.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        let full_frame = Rect {
+            x: 0,
+            y: 0,
+            w: 8,
+            h: 8,
+        };
+        write_precise_sprite(
+            &input.join("hero_idle_0.png"),
+            8,
+            8,
+            full_frame,
+            [240, 20, 30, 255],
+        );
+        write_precise_sprite(
+            &input.join("hero_idle_0_n.png"),
+            8,
+            8,
+            full_frame,
+            [128, 128, 255, 255],
+        );
+
+        let report = pack_with_pixel_snap(
+            PackOptions {
+                input,
+                output: output.clone(),
+                format: OutputFormat::Png,
+                pot: false,
+                padding: 0,
+                trim: false,
+                linked_channels: vec!["_n".to_string()],
+                ..PackOptions::default()
+            },
+            PixelSnapOptions {
+                enabled: true,
+                color_count: 4,
+                pixel_size: Some(4.0),
+                palette: "000000,ffffff".to_string(),
+                lock_grid: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.atlas.frames[0].source_size, Size { w: 2, h: 2 });
+        assert!(report.wrote.contains(&"sheet_n.png".to_string()));
+        let color_sheet = image::open(output.join("sheet.png")).unwrap().to_rgba8();
+        let normal_sheet = image::open(output.join("sheet_n.png")).unwrap().to_rgba8();
+        assert_eq!(color_sheet.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(normal_sheet.get_pixel(0, 0).0, [128, 128, 255, 255]);
+        assert_eq!(normal_sheet.dimensions(), color_sheet.dimensions());
+    }
 
     #[test]
     fn trims_transparent_borders() {
