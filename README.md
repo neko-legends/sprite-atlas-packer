@@ -30,6 +30,23 @@ and packing, with two selectable engines:
 - **Snapper** — the original single-detector edge-profile walker, kept for
   comparison and for tiny sources below the Fixer's 16 px minimum.
 
+![Same AI-damaged sprite packed with no finish, the Snapper engine, and the Fixer engine](docs/pixel-art-finish-engines.png)
+
+Measured on six frames of a 48×48 sprite resampled to 251×251 with bilinear
+filtering and blur (typical AI-generator damage), packed through the app's own
+control API:
+
+| Engine | Detected grid | Result |
+| --- | --- | --- |
+| Off | — | 251×251 mushy pseudo-pixels in the sheet |
+| Snapper | 46×46 | wrong lattice: misaligned cuts, wobbling silhouette |
+| Fixer | **48×48** | exact native grid, crisp one-color-per-cell art |
+
+This mirrors the upstream
+[pixel-bench](https://github.com/Retro-Diffusion/pixel-art-fixer) results,
+where the Fixer recovers the exact native resolution on 77% of 4,300 distorted
+inputs while snapper-class tools clear 5%.
+
 Both engines then:
 
 - rebuild each detected cell as one logical pixel;
