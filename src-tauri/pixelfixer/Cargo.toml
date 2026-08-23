@@ -1,0 +1,11 @@
+[package]
+name = "pixelfixer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pixel Art Fixer core, vendored from Retro-Diffusion/pixel-art-fixer (MIT, Copyright (c) 2026 Astropulse, LLC)"
+publish = false
+
+[dependencies]
+rayon = "1.12"
+rustfft = "6"

@@ -55,6 +55,7 @@ type PackOptions = {
   pixelSnapColors: number
   pixelSnapPalette: string
   pixelSnapLockGrid: boolean
+  pixelSnapEngine: 'fixer' | 'snapper'
 }
 
 type ProjectOptions = Omit<PackOptions, 'dryRun'>
@@ -245,6 +246,7 @@ const defaultOptions: PackOptions = {
   pixelSnapColors: 16,
   pixelSnapPalette: '',
   pixelSnapLockGrid: true,
+  pixelSnapEngine: 'fixer',
 }
 
 const defaultVideoOptions: VideoOptions = {
@@ -343,6 +345,7 @@ function loadOptions(): PackOptions {
           : 16,
       pixelSnapPalette: typeof parsed.pixelSnapPalette === 'string' ? parsed.pixelSnapPalette : '',
       pixelSnapLockGrid: typeof parsed.pixelSnapLockGrid === 'boolean' ? parsed.pixelSnapLockGrid : true,
+      pixelSnapEngine: parsed.pixelSnapEngine === 'snapper' ? 'snapper' : 'fixer',
     }
   } catch {
     return defaultOptions
@@ -2629,8 +2632,26 @@ function App() {
               <span>Snap artwork to a clean pixel grid</span>
             </label>
             <p className="panel-help">
-              Detects the implied grid, chooses one color per cell, and quantizes the palette before packing.
+              Recovers the true pixel grid from AI-generated or inconsistent art, rebuilds each cell as one logical pixel, and quantizes the palette before packing.
             </p>
+            <div className="format-toggle">
+              {(['fixer', 'snapper'] as const).map((engine) => (
+                <button
+                  className={classNames('format-button', options.pixelSnapEngine === engine && 'active')}
+                  key={engine}
+                  type="button"
+                  onClick={() => setOptions((current) => ({ ...current, pixelSnapEngine: engine }))}
+                  disabled={!options.pixelSnap}
+                  title={
+                    engine === 'fixer'
+                      ? 'Pixel Art Fixer: multi-detector consensus grid recovery, most robust on mushy or off-grid AI art'
+                      : 'Classic single-detector edge snapper'
+                  }
+                >
+                  {engine === 'fixer' ? 'FIXER' : 'SNAPPER'}
+                </button>
+              ))}
+            </div>
             <div className="pixel-finish-grid">
               <label className="field">
                 <span>Grid Pixel Size</span>

@@ -35,10 +35,10 @@ use thiserror::Error;
 use walkdir::WalkDir;
 
 mod pixel_snap;
-use pixel_snap::{PixelGrid, PixelSnapOptions};
+use pixel_snap::{PixelGrid, PixelSnapEngine, PixelSnapOptions};
 
 const APP_NAME: &str = "sprite-atlas-packer";
-const VERSION: &str = "26.6.25";
+const VERSION: &str = "26.8.23";
 const DEFAULT_DURATION_MS: u32 = 120;
 const DEFAULT_MAX_SIZE: u32 = 16384;
 const RASTER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
@@ -248,6 +248,8 @@ struct ProjectFile {
     pixel_snap_palette: String,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pixel_snap_lock_grid: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pixel_snap_engine: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     animations: Vec<AnimationDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +329,10 @@ fn default_generated_frame_size() -> u32 {
 
 fn default_pixel_snap_colors() -> usize {
     16
+}
+
+fn default_pixel_snap_engine() -> String {
+    "fixer".to_string()
 }
 
 fn is_false(value: &bool) -> bool {
@@ -508,6 +514,8 @@ pub struct GuiPackOptions {
     pub pixel_snap_palette: String,
     #[serde(default = "default_true")]
     pub pixel_snap_lock_grid: bool,
+    #[serde(default = "default_pixel_snap_engine")]
+    pub pixel_snap_engine: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -548,6 +556,8 @@ pub struct GuiProjectOptions {
     pub pixel_snap_palette: String,
     #[serde(default = "default_true")]
     pub pixel_snap_lock_grid: bool,
+    #[serde(default = "default_pixel_snap_engine")]
+    pub pixel_snap_engine: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1182,6 +1192,7 @@ fn save_project_gui(path: String, options: GuiProjectOptions) -> std::result::Re
     let pixel_snap_colors = options.pixel_snap_colors;
     let pixel_snap_palette = options.pixel_snap_palette.clone();
     let pixel_snap_lock_grid = options.pixel_snap_lock_grid;
+    let pixel_snap_engine = clean_optional_string(Some(options.pixel_snap_engine.clone()));
     let pack_options = PackOptions {
         input: PathBuf::from(options.input),
         output: PathBuf::from(options.output),
@@ -1221,6 +1232,7 @@ fn save_project_gui(path: String, options: GuiProjectOptions) -> std::result::Re
     project.pixel_snap_colors = Some(pixel_snap_colors);
     project.pixel_snap_palette = pixel_snap_palette;
     project.pixel_snap_lock_grid = pixel_snap_lock_grid;
+    project.pixel_snap_engine = pixel_snap_engine;
     let json = serde_json::to_string_pretty(&project).map_err(|error| error.to_string())?;
     write_text_if_changed(path, &format!("{json}\n")).map_err(|error| error.to_string())
 }
@@ -3352,6 +3364,7 @@ fn pixel_snap_options_from_gui(options: &GuiPackOptions) -> PixelSnapOptions {
         pixel_size: options.pixel_snap_size,
         palette: options.pixel_snap_palette.clone(),
         lock_grid: options.pixel_snap_lock_grid,
+        engine: PixelSnapEngine::parse(&options.pixel_snap_engine).unwrap_or_default(),
     }
 }
 
@@ -3709,6 +3722,9 @@ fn project_to_gui_options(project: ProjectFile, base: &Path) -> GuiProjectOption
             .unwrap_or_else(default_pixel_snap_colors),
         pixel_snap_palette: project.pixel_snap_palette,
         pixel_snap_lock_grid: project.pixel_snap_lock_grid,
+        pixel_snap_engine: project
+            .pixel_snap_engine
+            .unwrap_or_else(default_pixel_snap_engine),
     }
 }
 
@@ -3734,6 +3750,7 @@ fn project_from_options(options: &PackOptions) -> ProjectFile {
         pixel_snap_colors: None,
         pixel_snap_palette: String::new(),
         pixel_snap_lock_grid: true,
+        pixel_snap_engine: None,
         animations: options.animations.clone(),
         packing_strategy: Some(options.packing_strategy.as_str().to_string()),
     }
@@ -7566,6 +7583,7 @@ mod tests {
                 pixel_size: Some(4.0),
                 palette: "000000,ffffff".to_string(),
                 lock_grid: true,
+                engine: PixelSnapEngine::Snapper,
             },
         )
         .unwrap();
@@ -7621,6 +7639,7 @@ mod tests {
                 pixel_size: Some(4.0),
                 palette: "000000,ffffff".to_string(),
                 lock_grid: true,
+                engine: PixelSnapEngine::Snapper,
             },
         )
         .unwrap();
@@ -7632,6 +7651,55 @@ mod tests {
         assert_eq!(color_sheet.get_pixel(0, 0).0, [0, 0, 0, 255]);
         assert_eq!(normal_sheet.get_pixel(0, 0).0, [128, 128, 255, 255]);
         assert_eq!(normal_sheet.dimensions(), color_sheet.dimensions());
+    }
+
+    #[test]
+    fn pixel_art_finish_fixer_engine_recovers_native_grid() {
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("input");
+        let output = temp.path().join("output");
+        fs::create_dir_all(&input).unwrap();
+        // 16x16 logical pixels stored at 4x block scale (64x64), with a
+        // non-repeating per-cell pattern so detection cannot lock onto a
+        // content harmonic instead of the true 4 px cell.
+        let mut image = RgbaImage::new(64, 64);
+        for y in 0..64u32 {
+            for x in 0..64u32 {
+                let cell_x = x / 4;
+                let cell_y = y / 4;
+                let color = [
+                    ((cell_x * 37 + cell_y * 11) % 256) as u8,
+                    ((cell_x * 7 + cell_y * 53) % 256) as u8,
+                    ((cell_x * 23 + cell_y * 29) % 256) as u8,
+                    255,
+                ];
+                image.put_pixel(x, y, Rgba(color));
+            }
+        }
+        image.save(input.join("hero_idle_0.png")).unwrap();
+
+        let report = pack_with_pixel_snap(
+            PackOptions {
+                input,
+                output,
+                format: OutputFormat::Png,
+                pot: false,
+                padding: 0,
+                trim: false,
+                ..PackOptions::default()
+            },
+            PixelSnapOptions {
+                enabled: true,
+                color_count: 16,
+                pixel_size: None,
+                palette: String::new(),
+                lock_grid: true,
+                engine: PixelSnapEngine::Fixer,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.atlas.frames[0].source_size, Size { w: 16, h: 16 });
     }
 
     #[test]

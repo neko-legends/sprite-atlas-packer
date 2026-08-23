@@ -1,7 +1,7 @@
 {
   "name": "sprite-atlas-packer",
   "private": true,
-  "version": "26.6.25",
+  "version": "26.8.23",
   "license": "MIT",
   "type": "module",
   "scripts": {

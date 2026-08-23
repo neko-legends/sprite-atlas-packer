@@ -18,24 +18,36 @@ named `aseprite` on your PATH.
 
 The desktop app now includes an optional final-stage **Pixel Art Finish** panel
 for AI-generated or otherwise inconsistent pixel art. It runs before trimming
-and packing:
+and packing, with two selectable engines:
 
-- palette quantization reduces color drift;
-- edge profiles reveal the implied horizontal and vertical pixel grid;
-- an elastic grid walker follows imperfect block boundaries;
-- each detected cell becomes one logical pixel using its dominant color;
-- an optional custom hex palette constrains the final colors; and
-- auto-detected animation frames use one shared median grid by default so the
-  sprite does not change scale between frames.
+- **Fixer** (default) — the
+  [Retro Diffusion Pixel Art Fixer](https://github.com/Retro-Diffusion/pixel-art-fixer)
+  core, vendored in Rust. Three phase-invariant detectors vote on the implied
+  grid, a fused evidence stack arbitrates disagreements, and a two-stage
+  reconstruction votes cell structure over quantized labels while taking final
+  colors from the original un-quantized pixels. It handles non-integer cell
+  sizes, sub-pixel drift, heavy anti-aliasing, and JPEG damage.
+- **Snapper** — the original single-detector edge-profile walker, kept for
+  comparison and for tiny sources below the Fixer's 16 px minimum.
+
+Both engines then:
+
+- rebuild each detected cell as one logical pixel;
+- apply an optional custom hex palette to constrain the final colors; and
+- lock auto-detected animation frames to one shared median grid by default so
+  the sprite does not change scale between frames.
 
 Leave **Grid Pixel Size** blank to detect it, or enter the known source block
 size for the most predictable final sheet. The output is logical 1× pixel art,
 ready for nearest-neighbor scaling in the game engine. Pixel Art Finish is
 opt-in. Linked channel textures reuse each color sprite's exact detected grid
 and trim bounds without palette quantization, preserving normal-map, emissive,
-and mask values in their matching atlas sheets.
+and mask values in their matching atlas sheets. The Fixer engine accepts PNG
+sources from 16×16 up to 4 megapixels per frame.
 
-The implementation adapts MIT-licensed techniques from
+The Fixer engine vendors the MIT-licensed Rust core of
+[Retro-Diffusion/pixel-art-fixer](https://github.com/Retro-Diffusion/pixel-art-fixer);
+the Snapper engine adapts MIT-licensed techniques from
 [Sprite Fusion Pixel Snapper](https://github.com/Hugo-Dz/spritefusion-pixel-snapper);
 see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
@@ -79,6 +91,7 @@ Project files can pin a batch:
   "pixelSnapSize": null,
   "pixelSnapPalette": "",
   "pixelSnapLockGrid": true,
+  "pixelSnapEngine": "fixer",
   "godotSpriteframes": true,
   "unityImporter": true,
   "packingStrategy": "maxrects",

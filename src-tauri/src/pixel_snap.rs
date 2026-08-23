@@ -3,6 +3,34 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 const MAX_PALETTE_COLORS: usize = 256;
+const FIXER_MIN_SIDE: u32 = 16;
+const FIXER_MAX_PIXELS: u64 = 4_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PixelSnapEngine {
+    /// Sprite Fusion Pixel Snapper-style single-detector snapping.
+    Snapper,
+    /// Retro Diffusion Pixel Art Fixer consensus detection + two-stage pack.
+    Fixer,
+}
+
+impl PixelSnapEngine {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "snapper" => Ok(Self::Snapper),
+            "fixer" => Ok(Self::Fixer),
+            other => Err(format!(
+                "Pixel Snap engine must be 'fixer' or 'snapper'; got '{other}'"
+            )),
+        }
+    }
+}
+
+impl Default for PixelSnapEngine {
+    fn default() -> Self {
+        Self::Fixer
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct PixelSnapOptions {
@@ -11,6 +39,7 @@ pub(crate) struct PixelSnapOptions {
     pub pixel_size: Option<f64>,
     pub palette: String,
     pub lock_grid: bool,
+    pub engine: PixelSnapEngine,
 }
 
 impl Default for PixelSnapOptions {
@@ -21,6 +50,7 @@ impl Default for PixelSnapOptions {
             pixel_size: None,
             palette: String::new(),
             lock_grid: true,
+            engine: PixelSnapEngine::default(),
         }
     }
 }
@@ -104,6 +134,16 @@ pub(crate) fn snap_images_with_grids(
     if !options.enabled {
         return Err("Pixel Snap grid output requires Pixel Snap to be enabled".to_string());
     }
+    match options.engine {
+        PixelSnapEngine::Fixer => snap_images_fixer(images, options),
+        PixelSnapEngine::Snapper => snap_images_snapper(images, options),
+    }
+}
+
+fn snap_images_snapper(
+    images: &[RgbaImage],
+    options: &PixelSnapOptions,
+) -> Result<Vec<SnappedImage>, String> {
     let mut config = Config::from_options(options)?;
     if images.is_empty() {
         return Ok(Vec::new());
@@ -125,6 +165,131 @@ pub(crate) fn snap_images_with_grids(
         .iter()
         .map(|image| snap_image(image, &config))
         .collect()
+}
+
+/// Pixel Art Fixer engine (vendored `pixelfixer` crate, MIT, Retro Diffusion).
+/// Consensus grid detection followed by two-stage pack: cells vote over
+/// quantized labels for structure, then take color from the original pixels
+/// carrying the winning label, so lines stay crisp without clamping colors.
+fn snap_images_fixer(
+    images: &[RgbaImage],
+    options: &PixelSnapOptions,
+) -> Result<Vec<SnappedImage>, String> {
+    let config = Config::from_options(options)?;
+    if images.is_empty() {
+        return Ok(Vec::new());
+    }
+    for image in images {
+        let (width, height) = image.dimensions();
+        if width < FIXER_MIN_SIDE || height < FIXER_MIN_SIDE {
+            return Err(format!(
+                "Pixel Art Fixer requires images of at least {FIXER_MIN_SIDE}x{FIXER_MIN_SIDE} pixels; got {width}x{height}"
+            ));
+        }
+        if width as u64 * height as u64 > FIXER_MAX_PIXELS {
+            return Err(format!(
+                "Pixel Art Fixer supports at most {FIXER_MAX_PIXELS} pixels per image; got {width}x{height}"
+            ));
+        }
+        validate_dimensions(image, config.pixel_size_override)?;
+    }
+
+    let grids: Vec<(usize, usize)> = if let Some(pixel_size) = config.pixel_size_override {
+        images
+            .iter()
+            .map(|image| {
+                (
+                    (image.width() as f64 / pixel_size).round().max(1.0) as usize,
+                    (image.height() as f64 / pixel_size).round().max(1.0) as usize,
+                )
+            })
+            .collect()
+    } else {
+        let detections = images
+            .iter()
+            .map(|image| {
+                pixelfixer::core::detect_full(
+                    image.as_raw(),
+                    image.width() as usize,
+                    image.height() as usize,
+                )
+            })
+            .collect::<Vec<_>>();
+        if options.lock_grid && images.len() > 1 {
+            let mut steps = detections
+                .iter()
+                .map(|detection| (detection.step_x + detection.step_y) / 2.0)
+                .collect::<Vec<_>>();
+            steps.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+            let step = steps[steps.len() / 2].max(1.0);
+            images
+                .iter()
+                .map(|image| {
+                    (
+                        (image.width() as f64 / step).round().max(1.0) as usize,
+                        (image.height() as f64 / step).round().max(1.0) as usize,
+                    )
+                })
+                .collect()
+        } else {
+            detections
+                .iter()
+                .map(|detection| {
+                    (
+                        detection.cols.max(1) as usize,
+                        detection.rows.max(1) as usize,
+                    )
+                })
+                .collect()
+        }
+    };
+
+    images
+        .iter()
+        .zip(grids)
+        .map(|(image, (cols, rows))| {
+            let input_width = image.width();
+            let input_height = image.height();
+            let packed = pixelfixer::reconstruct::two_stage_pack(
+                image.as_raw(),
+                input_width as usize,
+                input_height as usize,
+                cols,
+                rows,
+                config.color_count,
+            );
+            let snapped =
+                RgbaImage::from_raw(packed.cols as u32, packed.rows as u32, packed.rgba)
+                    .ok_or_else(|| {
+                        "Pixel Art Fixer returned an inconsistent reconstruction buffer"
+                            .to_string()
+                    })?;
+            let image = match config.palette.as_deref() {
+                Some(palette) => apply_palette(&snapped, palette),
+                None => Ok(snapped),
+            }?;
+            Ok(SnappedImage {
+                image,
+                grid: even_grid(input_width, input_height, cols, rows),
+            })
+        })
+        .collect()
+}
+
+/// Even-lattice grid matching two_stage_pack's cell assignment
+/// (`cell = (x * cols) / width`), used for linked-channel resampling.
+fn even_grid(input_width: u32, input_height: u32, cols: usize, rows: usize) -> PixelGrid {
+    let cuts = |limit: u32, cells: usize| {
+        (0..=cells as u64)
+            .map(|index| (index * limit as u64).div_ceil(cells.max(1) as u64) as usize)
+            .collect::<Vec<_>>()
+    };
+    PixelGrid {
+        input_width,
+        input_height,
+        columns: cuts(input_width, cols),
+        rows: cuts(input_height, rows),
+    }
 }
 
 pub(crate) fn resample_linked_channel(
@@ -702,6 +867,7 @@ mod tests {
                 pixel_size: Some(4.0),
                 palette: String::new(),
                 lock_grid: true,
+                engine: PixelSnapEngine::Snapper,
             },
         )
         .unwrap();
@@ -720,6 +886,7 @@ mod tests {
                 pixel_size: Some(2.0),
                 palette: "000000,ffffff".to_string(),
                 lock_grid: true,
+                engine: PixelSnapEngine::Snapper,
             },
         )
         .unwrap();
