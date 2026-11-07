@@ -38,7 +38,7 @@ mod pixel_snap;
 use pixel_snap::{PixelGrid, PixelSnapEngine, PixelSnapOptions};
 
 const APP_NAME: &str = "sprite-atlas-packer";
-const VERSION: &str = "26.11.7";
+const VERSION: &str = "26.11.8";
 const DEFAULT_DURATION_MS: u32 = 120;
 const DEFAULT_MAX_SIZE: u32 = 16384;
 const RASTER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];

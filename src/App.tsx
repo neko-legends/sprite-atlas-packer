@@ -220,7 +220,7 @@ type Size = {
 }
 
 const SETTINGS_KEY = 'spriteAtlasPacker.settings.v1'
-const APP_VERSION_LABEL = 'v26.11.7'
+const APP_VERSION_LABEL = 'v26.11.8'
 const DEFAULT_GIF_FRAME_DURATION_MS = 120
 
 const defaultOptions: PackOptions = {
