@@ -38,7 +38,7 @@ mod pixel_snap;
 use pixel_snap::{PixelGrid, PixelSnapEngine, PixelSnapOptions};
 
 const APP_NAME: &str = "sprite-atlas-packer";
-const VERSION: &str = "26.8.23";
+const VERSION: &str = "26.11.7";
 const DEFAULT_DURATION_MS: u32 = 120;
 const DEFAULT_MAX_SIZE: u32 = 16384;
 const RASTER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
@@ -2966,9 +2966,17 @@ fn control_discovery_display_path() -> PathBuf {
 }
 
 fn agent_api_registry_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA")
+    // Same shared folder Neko Legends Control Center reads on each platform.
+    #[cfg(windows)]
+    let root = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    let root = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library").join("Application Support"));
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let root = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .map(|root| root.join("NekoLegends").join(AGENT_API_REGISTRY_FILE))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+    root.map(|root| root.join("NekoLegends").join(AGENT_API_REGISTRY_FILE))
 }
 
 fn registry_timestamp() -> String {

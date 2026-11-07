@@ -220,7 +220,7 @@ type Size = {
 }
 
 const SETTINGS_KEY = 'spriteAtlasPacker.settings.v1'
-const APP_VERSION_LABEL = 'v26.6.25'
+const APP_VERSION_LABEL = 'v26.11.7'
 const DEFAULT_GIF_FRAME_DURATION_MS = 120
 
 const defaultOptions: PackOptions = {
@@ -530,6 +530,10 @@ function localPathFromFileUri(value: string): string | null {
     const url = new URL(value)
     if (url.protocol !== 'file:') return null
     const decoded = decodeURIComponent(url.pathname)
+    // POSIX (Linux/macOS) file URIs are already native paths; only Windows
+    // paths (drive letter or a Windows host) get backslashes.
+    const isWindowsHost = typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent)
+    if (!isWindowsHost && !/^\/[A-Za-z]:/.test(decoded)) return decoded || null
     const windowsPath = decoded.replace(/^\/([A-Za-z]:)/, '$1').replace(/\//g, '\\')
     return windowsPath || null
   } catch {

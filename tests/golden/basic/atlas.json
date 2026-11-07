@@ -1,7 +1,7 @@
 {
   "meta": {
     "app": "sprite-atlas-packer",
-    "version": "26.8.23",
+    "version": "26.11.7",
     "image": "sheet.png",
     "size": {
       "w": 32,
